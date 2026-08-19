@@ -30,10 +30,9 @@ fi
 for e in "${ENGINES[@]}"; do
   tag="$e"
   case "$e" in
-    # pg and neo4j are pure Go and always compiled in, so they have no
-    # tag of their own and any binary can run them. They still get their
-    # own binary so nothing else is linked alongside.
-    pg|neo4j) tag="" ;;
+    # pg came with go-ycsb and has no tag, it is always compiled in. It
+    # still gets its own binary so nothing else is linked alongside.
+    pg) tag="" ;;
   esac
 
   echo "building $WORK/ycsb-$e${tag:+ (tag $tag)}"
