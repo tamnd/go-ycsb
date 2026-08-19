@@ -64,7 +64,7 @@ for mode in $MODES; do
       -p sqlite.db="$DB" -p sqlite.journalmode="$journal" \
       -p sqlite.synchronous="$sync" \
       -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1 \
-      | grep -E '^INSERT ' || true)
+      | grep -E '^INSERT ' | tail -1 || true)
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$journal" "$sync" "$w" load \
       "$(sed -n 's/.*OPS: \([0-9.]*\).*/\1/p' <<<"$load")" \
@@ -75,7 +75,7 @@ for mode in $MODES; do
       -p sqlite.db="$DB" -p sqlite.journalmode="$journal" \
       -p sqlite.synchronous="$sync" \
       -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
-      -p threadcount="$THREADS" 2>&1 | grep -E '^TOTAL ' || true)
+      -p threadcount="$THREADS" 2>&1 | grep -E '^TOTAL ' | tail -1 || true)
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$journal" "$sync" "$w" run \
       "$(sed -n 's/.*OPS: \([0-9.]*\).*/\1/p' <<<"$run")" \

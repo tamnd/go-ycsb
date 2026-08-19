@@ -92,8 +92,17 @@ field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
 
 printf 'engine\tworkload\tphase\top\tops\tavg_us\tp50_us\tp95_us\tp99_us\n' | tee -a "$OUT"
 
+# go-ycsb reports progress while a phase runs, and those lines carry the
+# same INSERT or READ prefix as the summary printed at the end. Taking
+# every matching line would report a mid run snapshot as if it were the
+# result, so keep only the last line seen for each operation.
+last_per_op() {
+  awk '{ seen[$1] = $0 } END { for (op in seen) print seen[op] }' | sort
+}
+
 emit() {  # emit <workload> <phase> <output>
   local w="$1" phase="$2" out="$3" line op
+  out="$(last_per_op <<<"$out")"
   while IFS= read -r line; do
     op="${line%% *}"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
