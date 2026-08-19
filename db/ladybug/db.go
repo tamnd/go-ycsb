@@ -69,6 +69,7 @@ const (
 	ladybugCompression = "ladybug.enable_compression"
 	ladybugMultiWrites = "ladybug.enable_multi_writes"
 	ladybugHashIndex   = "ladybug.enable_default_hash_index"
+	ladybugReadShape   = "ladybug.readshape"
 )
 
 type ladybugCreator struct{}
@@ -89,6 +90,7 @@ type ladybugDB struct {
 
 	fieldCount int64
 	table      string
+	readShape  string
 
 	mu    sync.Mutex
 	conns []*conn // every connection handed out, so Close can free them
@@ -103,6 +105,7 @@ func (c ladybugCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
 	d.fieldCount = p.GetInt64(prop.FieldCount, prop.FieldCountDefault)
 	d.table = p.GetString(prop.TableName, prop.TableNameDefault)
+	d.readShape = p.GetString(ladybugReadShape, "where")
 
 	path := p.GetString(ladybugDBPath, "/tmp/ladybug.lbug")
 	if p.GetBool(prop.DropData, prop.DropDataDefault) {
@@ -370,12 +373,32 @@ func connOf(ctx context.Context) *conn {
 	return c
 }
 
+// matchPoint writes the MATCH clause for a lookup on the primary key.
+//
+// Two shapes say the same thing and they do not cost the same. The
+// property is declared as ycsb_key STRING PRIMARY KEY, so the engine has
+// a hash index on it, but a scan sweep showed the WHERE form not using
+// it: read p50 went 358 us at 10000 records to 6039 us at 100000, which
+// is a straight line and not an index. Raising buffer_pool_size to 8 GB
+// changed nothing, so it was the plan and not the cache. The pattern
+// form is the other way to ask, and it is a property rather than a
+// hardcoded choice so both can be measured against each other on the
+// same build.
+func (db *ladybugDB) matchPoint(b *strings.Builder, table string) {
+	if db.readShape == "where" {
+		fmt.Fprintf(b, "MATCH (u:%s) WHERE u.ycsb_key = $k ", table)
+		return
+	}
+	fmt.Fprintf(b, "MATCH (u:%s {ycsb_key: $k}) ", table)
+}
+
 func (db *ladybugDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	c := connOf(ctx)
 	cols := db.fieldNames(fields)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "MATCH (u:%s) WHERE u.ycsb_key = $k RETURN ", table)
+	db.matchPoint(&b, table)
+	b.WriteString("RETURN ")
 	for i, f := range cols {
 		if i > 0 {
 			b.WriteString(", ")
@@ -431,7 +454,8 @@ func (db *ladybugDB) Update(ctx context.Context, table string, key string, value
 
 	pairs := util.NewFieldPairs(values)
 	var b strings.Builder
-	fmt.Fprintf(&b, "MATCH (u:%s) WHERE u.ycsb_key = $k SET ", table)
+	db.matchPoint(&b, table)
+	b.WriteString("SET ")
 	for i, p := range pairs {
 		if i > 0 {
 			b.WriteString(", ")
@@ -485,8 +509,10 @@ func (db *ladybugDB) Insert(ctx context.Context, table string, key string, value
 func (db *ladybugDB) Delete(ctx context.Context, table string, key string) error {
 	c := connOf(ctx)
 
-	text := fmt.Sprintf("MATCH (u:%s) WHERE u.ycsb_key = $k DELETE u", table)
-	stmt, err := c.prepared(text)
+	var b strings.Builder
+	db.matchPoint(&b, table)
+	b.WriteString("DELETE u")
+	stmt, err := c.prepared(b.String())
 	if err != nil {
 		return err
 	}
