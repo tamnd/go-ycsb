@@ -16,9 +16,17 @@ cd "$(dirname "$0")/.."
 
 RECORDS="${1:-10000}"
 THREADS="${2:-1}"
-BIN="${BIN:-/tmp/ycsb}"
-DB=/tmp/ycsb-sqlite-modes.db
-OUT="${OUT:-/tmp/sqlite-modes.tsv}"
+
+# Nothing lands in /tmp by default. On gamingpc the benchmark runs inside
+# WSL, WSL tears the VM down when it goes idle, and /tmp is tmpfs, so a
+# result written there is gone by the time it is collected. Ask me how I
+# know. Everything goes under the repo instead, which is on a real disk.
+WORK="${WORK:-$PWD/.bench}"
+mkdir -p "$WORK"
+
+BIN="${BIN:-$WORK/ycsb}"
+DB="$WORK/ycsb-sqlite-modes.db"
+OUT="${OUT:-$WORK/sqlite-modes.tsv}"
 
 if [ ! -x "$BIN" ]; then
   echo "building $BIN"
@@ -31,7 +39,20 @@ fi
 MODES="WAL:OFF WAL:NORMAL WAL:FULL DELETE:FULL MEMORY:OFF"
 WORKLOADS="a b c d e f"
 
-printf 'journal\tsync\tworkload\tphase\tops\tp50_us\tp99_us\n' | tee "$OUT"
+# A number without its conditions is not a result. The stamp goes in the
+# same file so the two cannot be separated by being copied somewhere.
+{
+  echo "# host: $(hostname)"
+  echo "# kernel: $(uname -sr)"
+  echo "# cpu: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null)"
+  echo "# cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+  echo "# loadavg at start: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
+  echo "# records: $RECORDS threads: $THREADS"
+  echo "# workdir: $WORK"
+  echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+} | tee "$OUT"
+
+printf 'journal\tsync\tworkload\tphase\tops\tp50_us\tp99_us\n' | tee -a "$OUT"
 
 for mode in $MODES; do
   journal="${mode%%:*}"
