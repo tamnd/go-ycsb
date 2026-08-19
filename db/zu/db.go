@@ -482,6 +482,66 @@ func (db *zuDB) Insert(ctx context.Context, table string, key string, values map
 	return err
 }
 
+// BatchInsert writes n rows as one INSERT with n patterns.
+//
+// This is worth having for a reason specific to zu. A commit folds what
+// the statement staged, and the fold rebuilds every column of the table
+// whole rather than appending to it, so one insert costs time
+// proportional to the rows already there and a row at a time load is
+// quadratic. The fold happens once per statement and not once per
+// pattern, so k patterns in one statement cost one fold instead of k.
+// That does not fix the quadratic term, it divides it by k, which is
+// the difference between a load that finishes and one that does not.
+//
+// BEGIN and COMMIT do not help here. zu folds at the end of every
+// statement whether or not a transaction is open, so a thousand inserts
+// inside one explicit transaction still cost a thousand folds. The
+// batching has to be inside the statement.
+//
+// Parameters are numbered per pattern because a prepared statement has
+// one namespace for all of them, so row 3's field0 is $f3_0.
+func (db *zuDB) BatchInsert(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	c := connOf(ctx)
+
+	rows := make([][]util.FieldPair, len(values))
+	var b strings.Builder
+	fmt.Fprintf(&b, "INSERT ")
+	for i := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		rows[i] = util.NewFieldPairs(values[i])
+		fmt.Fprintf(&b, "(:%s {ycsb_key: $k%d", table, i)
+		for _, p := range rows[i] {
+			fmt.Fprintf(&b, ", %s: $f%d_%s", p.Field, i, p.Field)
+		}
+		b.WriteString("})")
+	}
+
+	// The text varies with the batch size, so the last batch of a load
+	// gets its own entry in the statement cache rather than reusing the
+	// full sized one. That is two entries, not one per call.
+	stmt, err := c.prepared(b.String())
+	if err != nil {
+		return err
+	}
+	for i := range keys {
+		if err := bindStr(stmt, fmt.Sprintf("k%d", i), keys[i]); err != nil {
+			return err
+		}
+		for _, p := range rows[i] {
+			if err := bindStr(stmt, fmt.Sprintf("f%d_%s", i, p.Field), string(p.Value)); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = c.exec(stmt, nil, 0)
+	return err
+}
+
 func (db *zuDB) Delete(ctx context.Context, table string, key string) error {
 	c := connOf(ctx)
 
@@ -497,8 +557,51 @@ func (db *zuDB) Delete(ctx context.Context, table string, key string) error {
 	return err
 }
 
+// The other three batch operations are loops over the single row
+// version, which is what they honestly are here. Only INSERT has a
+// multi pattern form in GQL that collapses into one statement, so only
+// INSERT gets a real batch. Reads do not need one, since a read is not
+// what costs a fold, and batching the writes would need an IN list or
+// an UNWIND with a bound array, neither of which the C API can pass
+// because its binds are scalar only.
+//
+// They are here because BatchDB is one interface and the harness type
+// asserts against the whole of it, so BatchInsert is not reachable
+// without them.
+
+func (db *zuDB) BatchRead(ctx context.Context, table string, keys []string, fields []string) ([]map[string][]byte, error) {
+	out := make([]map[string][]byte, 0, len(keys))
+	for _, k := range keys {
+		row, err := db.Read(ctx, table, k, fields)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func (db *zuDB) BatchUpdate(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+	for i, k := range keys {
+		if err := db.Update(ctx, table, k, values[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *zuDB) BatchDelete(ctx context.Context, table string, keys []string) error {
+	for _, k := range keys {
+		if err := db.Delete(ctx, table, k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func init() {
 	ycsb.RegisterDBCreator("zu", zuCreator{})
 }
 
 var _ ycsb.DB = (*zuDB)(nil)
+var _ ycsb.BatchDB = (*zuDB)(nil)
