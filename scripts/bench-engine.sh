@@ -11,7 +11,7 @@
 #   scripts/bench-engine.sh duckdb 10000 1
 #   scripts/bench-engine.sh pg 10000 1
 #
-# The binary has to be built with the matching tag first. BIN overrides
+# One binary per engine, built by scripts/build-engine.sh. BIN overrides
 # where it is looked for.
 
 set -uo pipefail
@@ -27,11 +27,11 @@ THREADS="${3:-1}"
 WORK="${WORK:-$PWD/.bench}"
 mkdir -p "$WORK"
 
-BIN="${BIN:-$WORK/ycsb}"
+BIN="${BIN:-$WORK/ycsb-$ENGINE}"
 OUT="${OUT:-$WORK/$ENGINE-r$RECORDS-t$THREADS.tsv}"
 
 if [ ! -x "$BIN" ]; then
-  echo "no binary at $BIN, build it with the tag for $ENGINE" >&2
+  echo "no binary at $BIN, run scripts/build-engine.sh $ENGINE first" >&2
   exit 1
 fi
 
