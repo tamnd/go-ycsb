@@ -34,13 +34,13 @@ import (
 
 // DuckDB properties.
 const (
-	duckdbDBPath      = "duckdb.dbpath"
-	duckdbMemory      = "duckdb.memory"
-	duckdbThreads     = "duckdb.threads"
-	duckdbMemoryLimit = "duckdb.memory_limit"
-	duckdbMaxOpenConns = "duckdb.maxopenconns"
-	duckdbMaxIdleConns = "duckdb.maxidleconns"
-	duckdbRetries      = "duckdb.retries"
+	duckdbDBPath         = "duckdb.dbpath"
+	duckdbMemory         = "duckdb.memory"
+	duckdbThreads        = "duckdb.threads"
+	duckdbMemoryLimit    = "duckdb.memory_limit"
+	duckdbMaxOpenConns   = "duckdb.maxopenconns"
+	duckdbMaxIdleConns   = "duckdb.maxidleconns"
+	duckdbRetries        = "duckdb.retries"
 	duckdbRetryBackoffMs = "duckdb.retry_backoff_ms"
 )
 
@@ -94,11 +94,19 @@ func (c duckdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 
 	// DuckDB is a single writer engine with optimistic concurrency: two
 	// transactions touching the same row make one of them fail rather than
-	// block. Holding the pool at one connection by default keeps the
-	// benchmark measuring the engine instead of measuring conflict retries.
-	// Raise it deliberately when the point is to measure concurrency.
-	db.SetMaxOpenConns(p.GetInt(duckdbMaxOpenConns, 1))
-	db.SetMaxIdleConns(p.GetInt(duckdbMaxIdleConns, 1))
+	// block, which is why the retry loop below exists.
+	//
+	// The pool used to default to one connection to keep conflict retries
+	// out of the numbers. That was the wrong trade. A pool of one does not
+	// remove concurrency from the measurement, it moves the serialisation
+	// into database/sql where it is invisible, and it costs a great deal:
+	// at 10000 records on workload C, read ops/s at 1, 4 and 16 threads
+	// went 1549, 1514, 1516 with one connection and 1560, 5823, 14908 with
+	// the pool at threadcount. A flat line across four doublings looks
+	// like an engine that does not scale and it was the adapter.
+	threads := p.GetInt(prop.ThreadCount, prop.ThreadCountDefault)
+	db.SetMaxOpenConns(p.GetInt(duckdbMaxOpenConns, threads))
+	db.SetMaxIdleConns(p.GetInt(duckdbMaxIdleConns, threads))
 
 	d.db = db
 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
