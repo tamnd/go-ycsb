@@ -23,8 +23,12 @@ import (
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
 
-	// pg package
-	_ "github.com/lib/pq"
+	// pgx is the driver PostgreSQL work has moved to. lib/pq has been in
+	// maintenance for years and speaks the simple protocol, which costs a
+	// round trip per statement and reparses on the server every time. pgx
+	// uses the extended protocol with a statement cache, which is what
+	// anybody measuring PostgreSQL today would actually run.
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
 )
@@ -77,7 +81,7 @@ func (c pgCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 
 	dsn := fmt.Sprintf("postgres://%s:%s@%s:%d/%s?sslmode=%s", user, password, host, port, dbName, sslMode)
 	var err error
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		fmt.Printf("open pg failed %v", err)
 		return nil, err

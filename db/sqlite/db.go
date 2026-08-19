@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build libsqlite3
+//go:build sqlite
 
 package sqlite
 
@@ -39,9 +39,11 @@ const (
 	sqliteDBPath              = "sqlite.db"
 	sqliteMode                = "sqlite.mode"
 	sqliteJournalMode         = "sqlite.journalmode"
+	sqliteSynchronous         = "sqlite.synchronous"
 	sqliteCache               = "sqlite.cache"
 	sqliteMaxOpenConns        = "sqlite.maxopenconns"
 	sqliteMaxIdleConns        = "sqlite.maxidleconns"
+	sqliteBusyTimeout         = "sqlite.busy_timeout"
 	sqliteOptimistic          = "sqlite.optimistic"
 	sqliteOptimisticBackoffMs = "sqlite.optimistic_backoff_ms"
 )
@@ -71,14 +73,46 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 
 	mode := p.GetString(sqliteMode, "rwc")
 	journalMode := p.GetString(sqliteJournalMode, "WAL")
-	cache := p.GetString(sqliteCache, "shared")
-	maxOpenConns := p.GetInt(sqliteMaxOpenConns, 1)
-	maxIdleConns := p.GetInt(sqliteMaxIdleConns, 2)
+	// Every engine here runs at its fastest configuration so the number is a
+	// throughput ceiling, and the level is still an explicit property so it
+	// lands in the result rather than being inherited silently. OFF is not
+	// crash durable; the point of recording it is that the same choice is
+	// made for every engine, and a durable row can be taken by overriding.
+	synchronous := p.GetString(sqliteSynchronous, "OFF")
+	// Two defaults changed from upstream, and they are the difference
+	// between measuring SQLite and measuring a pool of one.
+	//
+	// Upstream runs cache=shared with maxopenconns=1. In WAL mode that
+	// is the slow way round. Shared cache serialises readers on a table
+	// lock, so opening the pool without also leaving shared cache makes
+	// things worse rather than better. Measured at 10000 records on
+	// workload C, ops/s at 1, 4 and 16 threads:
+	//
+	//	shared, 1 conn    47688   53305    41913
+	//	shared, n conns   48200   27473    27940
+	//	private, n conns  48092  108671   119927
+	//
+	// So the old defaults cost SQLite a factor of nearly three at 16
+	// threads, and this benchmark exists to compare engines at their
+	// fastest rather than to publish a number that a configuration
+	// choice held down.
+	//
+	// A pool wider than one needs a busy timeout, because WAL gives
+	// concurrent readers but still one writer, and the second writer
+	// gets SQLITE_BUSY immediately without one. Five seconds is long
+	// enough that a benchmark never sees it and short enough that a real
+	// deadlock still fails.
+	cache := p.GetString(sqliteCache, "private")
+	threads := int(p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault))
+	maxOpenConns := p.GetInt(sqliteMaxOpenConns, threads)
+	maxIdleConns := p.GetInt(sqliteMaxIdleConns, threads)
 
 	v := url.Values{}
 	v.Set("cache", cache)
 	v.Set("mode", mode)
 	v.Set("_journal_mode", journalMode)
+	v.Set("_synchronous", synchronous)
+	v.Set("_busy_timeout", p.GetString(sqliteBusyTimeout, "5000"))
 	dsn := fmt.Sprintf("file:%s?%s", dbPath, v.Encode())
 	var err error
 	db, err := sql.Open("sqlite3", dsn)
