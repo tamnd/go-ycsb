@@ -48,7 +48,7 @@ for mode in $MODES; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$journal" "$sync" "$w" load \
       "$(sed -n 's/.*OPS: \([0-9.]*\).*/\1/p' <<<"$load")" \
       "$(sed -n 's/.*50th(us): \([0-9]*\).*/\1/p' <<<"$load")" \
-      "$(sed -n 's/.*99th(us): \([0-9]*\).*/\1/p' <<<"$load")" | tee -a "$OUT"
+      "$(sed -n 's/.*, 99th(us): \([0-9]*\).*/\1/p' <<<"$load")" | tee -a "$OUT"
 
     run=$("$BIN" run sqlite -P "workloads/workload$w" \
       -p sqlite.db="$DB" -p sqlite.journalmode="$journal" \
@@ -59,7 +59,7 @@ for mode in $MODES; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$journal" "$sync" "$w" run \
       "$(sed -n 's/.*OPS: \([0-9.]*\).*/\1/p' <<<"$run")" \
       "$(sed -n 's/.*50th(us): \([0-9]*\).*/\1/p' <<<"$run")" \
-      "$(sed -n 's/.*99th(us): \([0-9]*\).*/\1/p' <<<"$run")" | tee -a "$OUT"
+      "$(sed -n 's/.*, 99th(us): \([0-9]*\).*/\1/p' <<<"$run")" | tee -a "$OUT"
   done
 done
 
