@@ -80,6 +80,8 @@ import (
 	_ "github.com/pingcap/go-ycsb/db/duckdb"
 	// Register ladybug database
 	_ "github.com/pingcap/go-ycsb/db/ladybug"
+	// Register neo4j database
+	_ "github.com/pingcap/go-ycsb/db/neo4j"
 	// Register s3 database
 	_ "github.com/pingcap/go-ycsb/db/s3"
 )

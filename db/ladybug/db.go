@@ -23,17 +23,20 @@
 // in architecture or plane, which gives a gap an easy excuse. There is
 // no excuse available against this one.
 //
-// Build tag: ladybug. The cgo directives below assume a Homebrew keg.
-// cgo cannot read environment variables, so other layouts override at
-// build time:
+// Build tag: ladybug. The cgo directives below cover a Homebrew keg on
+// macOS and a release tarball unpacked into /usr/local on Linux. Any
+// other layout is handed in at build time, since cgo cannot read the
+// environment itself:
 //
 //	CGO_CFLAGS="-I$LBUG_INCLUDE" CGO_LDFLAGS="-L$LBUG_LIB -llbug" \
 //	  go build -tags ladybug ./cmd/go-ycsb
 package ladybug
 
 /*
-#cgo CFLAGS: -I/opt/homebrew/opt/ladybug/include
-#cgo LDFLAGS: -L/opt/homebrew/opt/ladybug/lib -llbug -Wl,-rpath,/opt/homebrew/opt/ladybug/lib
+#cgo darwin CFLAGS: -I/opt/homebrew/opt/ladybug/include
+#cgo darwin LDFLAGS: -L/opt/homebrew/opt/ladybug/lib -llbug -Wl,-rpath,/opt/homebrew/opt/ladybug/lib
+#cgo linux CFLAGS: -I/usr/local/include
+#cgo linux LDFLAGS: -L/usr/local/lib -llbug -lstdc++ -lm -ldl -Wl,-rpath,/usr/local/lib
 #include <stdlib.h>
 #include "lbug.h"
 */
