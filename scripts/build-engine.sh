@@ -35,9 +35,23 @@ for e in "${ENGINES[@]}"; do
     pg) tag="" ;;
   esac
 
+  # Extra link flags, per engine and per platform.
+  #
+  # liblbug is a static archive on Linux and it does not carry its own
+  # dependencies, so the link fails on a wall of undefined references to
+  # OpenSSL out of the extension installer and to __atomic_compare_exchange
+  # out of the buffer manager. That reads like a broken library and is not
+  # one, the caller just has to name what the archive uses. The cgo lines
+  # in db.go cover the Homebrew case on macOS, so this only fires on Linux
+  # and only if the caller has not already set CGO_LDFLAGS.
+  ldflags="${CGO_LDFLAGS:-}"
+  if [ "$e" = ladybug ] && [ -z "$ldflags" ] && [ "$(uname -s)" = Linux ]; then
+    ldflags="-L${LBUG_LIB:-/usr/local/lib} -llbug -lssl -lcrypto -latomic -lstdc++ -lm -ldl -Wl,-rpath,${LBUG_LIB:-/usr/local/lib}"
+  fi
+
   echo "building $WORK/ycsb-$e${tag:+ (tag $tag)}"
   if [ -n "$tag" ]; then
-    go build -tags "$tag" -o "$WORK/ycsb-$e" ./cmd/go-ycsb
+    CGO_LDFLAGS="$ldflags" go build -tags "$tag" -o "$WORK/ycsb-$e" ./cmd/go-ycsb
   else
     go build -o "$WORK/ycsb-$e" ./cmd/go-ycsb
   fi
