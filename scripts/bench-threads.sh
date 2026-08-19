@@ -17,6 +17,15 @@
 #
 #   scripts/bench-threads.sh sqlite 1 2 4 8 16
 #   RECORDS=50000 scripts/bench-threads.sh pg
+#   WORKLOAD=workloada scripts/bench-threads.sh sqlite 1 4 16
+#
+# WORKLOAD picks the workload file and defaults to workloadc. Anything
+# other than C writes, and then the note above about the dataset
+# surviving the sweep stops being true in the sense that matters: the row
+# count is stable but the contents are not, and later points run against
+# data earlier points modified. For A and F that is acceptable because
+# the keys and the sizes are what drive the cost. For a workload that
+# grows the table it would not be, and there is no such workload here.
 #
 # BATCH sets -p batch.size for the load phase only. It changes how long
 # the load takes and not what the run phase measures, which is the point
@@ -31,6 +40,7 @@ shift
 THREADS=("$@")
 [ ${#THREADS[@]} -eq 0 ] && THREADS=(1 2 4 8 16)
 
+WORKLOAD="${WORKLOAD:-workloadc}"
 RECORDS="${RECORDS:-10000}"
 BATCH="${BATCH:-1}"
 OPS="${OPS:-20000}"
@@ -40,7 +50,7 @@ WORK="${WORK:-$PWD/.bench}"
 mkdir -p "$WORK"
 
 BIN="${BIN:-$WORK/ycsb-$ENGINE}"
-OUT="${OUT:-$WORK/$ENGINE-threads-r$RECORDS.tsv}"
+OUT="${OUT:-$WORK/$ENGINE-threads-$WORKLOAD-r$RECORDS.tsv}"
 
 if [ ! -x "$BIN" ]; then
   echo "no binary at $BIN, run scripts/build-engine.sh $ENGINE first" >&2
@@ -83,7 +93,7 @@ case "$ENGINE" in pg|neo4j) DROP=(-p dropdata=true) ;; esac
 field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | tail -1; }
 
 {
-  echo "# engine: $ENGINE records: $RECORDS load batch: $BATCH ops per point: $OPS"
+  echo "# engine: $ENGINE workload: $WORKLOAD records: $RECORDS load batch: $BATCH ops per point: $OPS"
   echo "# extra: ${EXTRA_ARGS:-none}"
   echo "# host: $(hostname)"
   echo "# kernel: $(uname -sr)"
@@ -94,21 +104,28 @@ field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | tail -1; }
 } | tee "$OUT"
 
 echo "loading $RECORDS records into $ENGINE" >&2
-"$BIN" load "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${EXTRA[@]}" "${DROP[@]}" \
+"$BIN" load "$ENGINE" -P "workloads/$WORKLOAD" "${ARGS[@]}" "${EXTRA[@]}" "${DROP[@]}" \
   -p recordcount="$RECORDS" -p threadcount=1 -p batch.size="$BATCH" >/dev/null 2>&1
 
-printf 'engine\trecords\tthreads\tread_ops\tread_p50_us\tread_p99_us\n' | tee -a "$OUT"
+printf 'engine\tworkload\trecords\tthreads\top\tops\tp50_us\tp99_us\n' | tee -a "$OUT"
 
 for t in "${THREADS[@]}"; do
-  out=$("$BIN" run "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${EXTRA[@]}" \
-    -p recordcount="$RECORDS" -p operationcount="$OPS" -p threadcount="$t" 2>&1 \
-    | grep -E '^READ ' | tail -1)
+  all=$("$BIN" run "$ENGINE" -P "workloads/$WORKLOAD" "${ARGS[@]}" "${EXTRA[@]}" \
+    -p recordcount="$RECORDS" -p operationcount="$OPS" -p threadcount="$t" 2>&1)
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$ENGINE" "$RECORDS" "$t" \
-    "$(field 'OPS' "$out")" \
-    "$(field ', 50th(us)' "$out")" \
-    "$(field ', 99th(us)' "$out")" | tee -a "$OUT"
+  # One row per operation kind rather than per run. Workload C has only
+  # READ, A has READ and UPDATE, and the mix is the thing being measured
+  # so both halves have to be visible. TOTAL comes last and is the one to
+  # quote for a mixed workload.
+  for op in READ UPDATE INSERT SCAN READ_MODIFY_WRITE TOTAL; do
+    line=$(grep -E "^$op " <<<"$all" | tail -1)
+    [ -z "$line" ] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$ENGINE" "$WORKLOAD" "$RECORDS" "$t" "$op" \
+      "$(field 'OPS' "$line")" \
+      "$(field ', 50th(us)' "$line")" \
+      "$(field ', 99th(us)' "$line")" | tee -a "$OUT"
+  done
 done
 
 case "$ENGINE" in
