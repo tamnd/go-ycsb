@@ -52,6 +52,17 @@ WORKLOADS="a b c d e f"
   echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } | tee "$OUT"
 
+# field pulls one metric out of a go-ycsb summary line.
+#
+# It takes the last match rather than the first because a phase slow
+# enough to cross the reporting interval emits a progress line every ten
+# seconds, and the last one is the summary. The DELETE/FULL sqlite runs
+# are slow enough to do that, and without this the TSV came out with
+# three stacked values in one cell.
+field() {
+  sed -n "s/.*$1: \\([0-9.]*\\).*/\\1/p" <<<"$2" | tail -1
+}
+
 printf 'journal\tsync\tworkload\tphase\tops\tp50_us\tp99_us\n' | tee -a "$OUT"
 
 for mode in $MODES; do
@@ -67,9 +78,7 @@ for mode in $MODES; do
       | grep -E '^INSERT ' | tail -1 || true)
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$journal" "$sync" "$w" load \
-      "$(sed -n 's/.*OPS: \([0-9.]*\).*/\1/p' <<<"$load")" \
-      "$(sed -n 's/.*50th(us): \([0-9]*\).*/\1/p' <<<"$load")" \
-      "$(sed -n 's/.*, 99th(us): \([0-9]*\).*/\1/p' <<<"$load")" | tee -a "$OUT"
+      "$(field 'OPS' "$load")" "$(field '50th(us)' "$load")" "$(field ', 99th(us)' "$load")" | tee -a "$OUT"
 
     run=$("$BIN" run sqlite -P "workloads/workload$w" \
       -p sqlite.db="$DB" -p sqlite.journalmode="$journal" \
@@ -78,9 +87,7 @@ for mode in $MODES; do
       -p threadcount="$THREADS" 2>&1 | grep -E '^TOTAL ' | tail -1 || true)
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$journal" "$sync" "$w" run \
-      "$(sed -n 's/.*OPS: \([0-9.]*\).*/\1/p' <<<"$run")" \
-      "$(sed -n 's/.*50th(us): \([0-9]*\).*/\1/p' <<<"$run")" \
-      "$(sed -n 's/.*, 99th(us): \([0-9]*\).*/\1/p' <<<"$run")" | tee -a "$OUT"
+      "$(field 'OPS' "$run")" "$(field '50th(us)' "$run")" "$(field ', 99th(us)' "$run")" | tee -a "$OUT"
   done
 done
 
