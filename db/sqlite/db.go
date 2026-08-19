@@ -72,10 +72,12 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 
 	mode := p.GetString(sqliteMode, "rwc")
 	journalMode := p.GetString(sqliteJournalMode, "WAL")
-	// Durability has to be stated rather than inherited. Comparing an engine
-	// that fsyncs every commit against one that does not is not a comparison,
-	// so the level is an explicit property and FULL is the published default.
-	synchronous := p.GetString(sqliteSynchronous, "FULL")
+	// Every engine here runs at its fastest configuration so the number is a
+	// throughput ceiling, and the level is still an explicit property so it
+	// lands in the result rather than being inherited silently. OFF is not
+	// crash durable; the point of recording it is that the same choice is
+	// made for every engine, and a durable row can be taken by overriding.
+	synchronous := p.GetString(sqliteSynchronous, "OFF")
 	cache := p.GetString(sqliteCache, "shared")
 	maxOpenConns := p.GetInt(sqliteMaxOpenConns, 1)
 	maxIdleConns := p.GetInt(sqliteMaxIdleConns, 2)
