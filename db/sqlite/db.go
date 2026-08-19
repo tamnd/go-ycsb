@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build libsqlite3
+//go:build sqlite
 
 package sqlite
 
@@ -39,6 +39,7 @@ const (
 	sqliteDBPath              = "sqlite.db"
 	sqliteMode                = "sqlite.mode"
 	sqliteJournalMode         = "sqlite.journalmode"
+	sqliteSynchronous         = "sqlite.synchronous"
 	sqliteCache               = "sqlite.cache"
 	sqliteMaxOpenConns        = "sqlite.maxopenconns"
 	sqliteMaxIdleConns        = "sqlite.maxidleconns"
@@ -71,6 +72,10 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 
 	mode := p.GetString(sqliteMode, "rwc")
 	journalMode := p.GetString(sqliteJournalMode, "WAL")
+	// Durability has to be stated rather than inherited. Comparing an engine
+	// that fsyncs every commit against one that does not is not a comparison,
+	// so the level is an explicit property and FULL is the published default.
+	synchronous := p.GetString(sqliteSynchronous, "FULL")
 	cache := p.GetString(sqliteCache, "shared")
 	maxOpenConns := p.GetInt(sqliteMaxOpenConns, 1)
 	maxIdleConns := p.GetInt(sqliteMaxIdleConns, 2)
@@ -79,6 +84,7 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	v.Set("cache", cache)
 	v.Set("mode", mode)
 	v.Set("_journal_mode", journalMode)
+	v.Set("_synchronous", synchronous)
 	dsn := fmt.Sprintf("file:%s?%s", dbPath, v.Encode())
 	var err error
 	db, err := sql.Open("sqlite3", dsn)
