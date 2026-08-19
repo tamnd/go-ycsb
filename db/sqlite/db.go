@@ -103,7 +103,7 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	// enough that a benchmark never sees it and short enough that a real
 	// deadlock still fails.
 	cache := p.GetString(sqliteCache, "private")
-	threads := p.GetInt(prop.ThreadCount, prop.ThreadCountDefault)
+	threads := int(p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault))
 	maxOpenConns := p.GetInt(sqliteMaxOpenConns, threads)
 	maxIdleConns := p.GetInt(sqliteMaxIdleConns, threads)
 

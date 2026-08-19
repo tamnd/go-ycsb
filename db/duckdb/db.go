@@ -104,7 +104,7 @@ func (c duckdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	// went 1549, 1514, 1516 with one connection and 1560, 5823, 14908 with
 	// the pool at threadcount. A flat line across four doublings looks
 	// like an engine that does not scale and it was the adapter.
-	threads := p.GetInt(prop.ThreadCount, prop.ThreadCountDefault)
+	threads := int(p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault))
 	db.SetMaxOpenConns(p.GetInt(duckdbMaxOpenConns, threads))
 	db.SetMaxIdleConns(p.GetInt(duckdbMaxIdleConns, threads))
 
