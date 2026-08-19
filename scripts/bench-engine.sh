@@ -48,14 +48,17 @@ case "$ENGINE" in
     ENGINE_ARGS=(-p "duckdb.dbpath=$DATA.db")
     ;;
   pg)
-    ENGINE_ARGS=(-p pg.host="${PGHOST:-127.0.0.1}" -p pg.port="${PGPORT:-5432}"
-                 -p pg.user="${PGUSER:-postgres}" -p pg.password="${PGPASSWORD:-}"
+    # 55432 rather than 5432 because a host that already runs PostgreSQL
+    # for something else should not have to stop it to be measured, and
+    # measuring somebody else's tuned instance by accident is worse.
+    ENGINE_ARGS=(-p pg.host="${PGHOST:-127.0.0.1}" -p pg.port="${PGPORT:-55432}"
+                 -p pg.user="${PGUSER:-postgres}" -p pg.password="${PGPASSWORD:-benchpass}"
                  -p pg.db="${PGDATABASE:-ycsb}" -p pg.sslmode=disable)
     ;;
   neo4j)
     ENGINE_ARGS=(-p neo4j.uri="${NEO4J_URI:-bolt://127.0.0.1:7687}"
                  -p neo4j.username="${NEO4J_USER:-neo4j}"
-                 -p neo4j.password="${NEO4J_PASSWORD:-password}")
+                 -p neo4j.password="${NEO4J_PASSWORD:-benchpass}")
     ;;
   ladybug)
     ENGINE_ARGS=(-p "ladybug.dbpath=$DATA.lbug")
@@ -73,9 +76,19 @@ reset_data() {
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
     ladybug) rm -rf "$DATA.lbug" ;;
     zu)      rm -rf "$DATA.zu1" ;;
-    pg|neo4j) : ;;  # server side, the adapter drops and recreates
+    pg|neo4j) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
 }
+
+# The file backed engines start each workload from an empty path, so the
+# load phase is a load into nothing. The two server side engines have no
+# path to delete, so they get told to drop instead. dropdata defaults to
+# false, and without this the second workload would be loading on top of
+# the first and every insert after A would be a duplicate key.
+LOAD_ARGS=()
+case "$ENGINE" in
+  pg|neo4j) LOAD_ARGS=(-p dropdata=true) ;;
+esac
 
 field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
 
@@ -118,12 +131,12 @@ emit() {  # emit <workload> <phase> <output>
 for w in a b c d e f; do
   reset_data
 
-  load_out=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" \
+  load_out=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" "${LOAD_ARGS[@]}" \
     -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1 \
     | grep -E '^(INSERT|TOTAL) ')
   if [ -z "$load_out" ]; then
     echo "# load failed for workload $w, see $WORK/$ENGINE-fail-$w.log" | tee -a "$OUT"
-    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" \
+    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" "${LOAD_ARGS[@]}" \
       -p recordcount="$RECORDS" -p threadcount="$THREADS" > "$WORK/$ENGINE-fail-$w.log" 2>&1
     continue
   fi
