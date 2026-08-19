@@ -93,6 +93,15 @@ for r in "${RECORDS[@]}"; do
     | grep -E '^(INSERT|BATCH_INSERT) ' | tail -1)
   end=$(date +%s.%N)
 
+  # A load that printed no summary line did not load anything. Say so
+  # here rather than letting the row through, because the row it produces
+  # looks like a win: wall time near zero divides into a load rate of
+  # half a million per second, and the only sign it is wrong is the empty
+  # read column further along the same line.
+  if [ -z "$load_out" ]; then
+    echo "load failed for $ENGINE at $r records, no summary line" >&2
+  fi
+
   # Wall time rather than the summary OPS line, because with batching on
   # the summary counts batches and not rows, and the two are not the same
   # number divided by anything obvious once the last batch is short.
