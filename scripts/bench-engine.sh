@@ -137,6 +137,17 @@ emit() {  # emit <workload> <phase> <output>
   done <<<"$out" | tee -a "$OUT"
 }
 
+# An adapter may print what its engine left on the device. Only zu2 does
+# so far, and the line is what the filesystem is holding rather than the
+# file length, which is the only version of that number worth recording.
+# It goes in as a comment because it is one line a phase and not a row.
+storage() {  # storage <workload> <phase> <output>
+  local note
+  note="$(grep -E '^[a-z0-9]+ storage: ' <<<"$3" | tail -1)"
+  [ -n "$note" ] && echo "# $1 $2: $note" | tee -a "$OUT"
+  return 0
+}
+
 # Workload E is short range scans. zu2 has no ordered iteration under it,
 # its index is a hash, and its adapter says so rather than faking one, so
 # the workload is skipped with a line in the file instead of filling a row
@@ -154,9 +165,9 @@ for w in a b c d e f; do
 
   reset_data
 
-  load_out=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
-    -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1 \
-    | grep -E '^(INSERT|TOTAL) ')
+  raw=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
+    -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1)
+  load_out=$(grep -E '^(INSERT|TOTAL) ' <<<"$raw")
   if [ -z "$load_out" ]; then
     echo "# load failed for workload $w, see $WORK/$ENGINE-fail-$w.log" | tee -a "$OUT"
     "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
@@ -164,12 +175,14 @@ for w in a b c d e f; do
     continue
   fi
   emit "$w" load "$load_out"
+  storage "$w" load "$raw"
 
-  run_out=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" \
+  raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
-    -p threadcount="$THREADS" 2>&1 \
-    | grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ')
+    -p threadcount="$THREADS" 2>&1)
+  run_out=$(grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ' <<<"$raw")
   emit "$w" run "$run_out"
+  storage "$w" run "$raw"
 done
 
 reset_data

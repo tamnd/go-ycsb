@@ -395,6 +395,13 @@ func (db *zu2DB) Close() error {
 // space as well as speed. Disk bytes and not file length: compaction
 // punches holes, and a holed file still reports the length that counts
 // them.
+//
+// The index entry count is entries in use and not keys stored. A zu2
+// bucket is eight slots with no overflow pointer, so a key that arrives
+// at a full bucket takes an entry over and chains behind it in the log,
+// and it stops owning an entry of its own. At the sizing this harness
+// asks for that is a handful of keys in twenty thousand, so the count
+// reads a little under the record count and nothing is missing.
 func (db *zu2DB) printStorage() {
 	var disk C.uint64_t
 	if st := C.zu2_disk_bytes(db.db, &disk); st != C.ZU2_OK {
