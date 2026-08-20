@@ -36,11 +36,24 @@
 //	  go build -tags zu ./cmd/go-ycsb
 //
 // Build libzu first with cargo build --release -p zu-capi in the zu repo.
+//
+// Windows links zu.dll through its import library, named explicitly with
+// -l:zu.dll.lib rather than left to -lzu, for the same reason db/zu2
+// does it: the zu repo pins an MSVC toolchain in rust-toolchain.toml, so
+// the static archive next to the DLL is MSVC flavoured and a mingw cgo
+// link cannot consume it. The DLL is a C interface and crosses that
+// boundary fine. Copy zu.dll beside the binary, or put its directory on
+// PATH, since Windows has no rpath to record where it came from.
+//
+// Without this the only quiet benchmark host cannot build a zu1 binary
+// at all, which is how the zu1 column went missing from every sweep that
+// gamingpc ran.
 package zu
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../zu/crates/zu-capi/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu -Wl,-rpath,${SRCDIR}/../../../zu/target/release
+#cgo !windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu -Wl,-rpath,${SRCDIR}/../../../zu/target/release
+#cgo windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -l:zu.dll.lib
 #include <stdlib.h>
 #include "zu.h"
 */
