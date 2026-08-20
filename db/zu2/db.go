@@ -50,11 +50,18 @@
 //
 // Build libzu2 first with cargo build --release -p zu2-capi in the zu
 // repo.
+//
+// Windows links the static archive instead, because there is no rpath
+// to point a loader at and a DLL next to a binary is one more thing to
+// keep in step. The libraries named on that line are what rustc reports
+// under --print native-static-libs for this crate, which is the answer
+// rather than a guess.
 package zu2
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../zu/crates/zu2-capi/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu2 -Wl,-rpath,${SRCDIR}/../../../zu/target/release
+#cgo !windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu2 -Wl,-rpath,${SRCDIR}/../../../zu/target/release
+#cgo windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu2 -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp
 #include <stdlib.h>
 #include "zu2.h"
 */
