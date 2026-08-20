@@ -148,6 +148,22 @@ storage() {  # storage <workload> <phase> <output>
   return 0
 }
 
+# The same question asked of every engine by the filesystem rather than
+# by the engine. du counts blocks, so a file with holes punched in it by
+# a compaction is counted at what it really costs and a file with a free
+# list inside it is counted at what it really holds. The engines with no
+# local path print nothing. This runs after the phase, with the process
+# gone, and before the next workload wipes the path.
+space() {  # space <workload> <phase>
+  local kb
+  kb="$(du -sk "$DATA".* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')"
+  [ "${kb:-0}" -gt 0 ] || return 0
+  awk -v w="$1" -v p="$2" -v e="$ENGINE" -v kb="$kb" -v n="$RECORDS" \
+    'BEGIN { printf "# %s %s: %s on device %.1f MiB, %.0f bytes a record\n", w, p, e, kb / 1024, kb * 1024 / n }' \
+    | tee -a "$OUT"
+  return 0
+}
+
 # Workload E is short range scans. zu2 has no ordered iteration under it,
 # its index is a hash, and its adapter says so rather than faking one, so
 # the workload is skipped with a line in the file instead of filling a row
@@ -176,6 +192,7 @@ for w in a b c d e f; do
   fi
   emit "$w" load "$load_out"
   storage "$w" load "$raw"
+  space "$w" load
 
   raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
@@ -183,6 +200,7 @@ for w in a b c d e f; do
   run_out=$(grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ' <<<"$raw")
   emit "$w" run "$run_out"
   storage "$w" run "$raw"
+  space "$w" run
 done
 
 reset_data
