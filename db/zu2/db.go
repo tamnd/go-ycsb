@@ -51,17 +51,20 @@
 // Build libzu2 first with cargo build --release -p zu2-capi in the zu
 // repo.
 //
-// Windows links the static archive instead, because there is no rpath
-// to point a loader at and a DLL next to a binary is one more thing to
-// keep in step. The libraries named on that line are what rustc reports
-// under --print native-static-libs for this crate, which is the answer
-// rather than a guess.
+// Windows links zu2.dll through its import library, named explicitly
+// with -l:zu2.dll.lib rather than left to -lzu2. The zu repo pins an
+// MSVC toolchain in rust-toolchain.toml, so the static archive next to
+// the DLL is MSVC flavoured and a mingw cgo link cannot consume it: it
+// ends in undefined references to __chkstk and to the MSVC type_info
+// vtable. The DLL is a C interface and crosses that boundary fine.
+// Copy zu2.dll beside the binary, or put its directory on PATH, since
+// Windows has no rpath to record where it came from.
 package zu2
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../../../zu/crates/zu2-capi/include
 #cgo !windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu2 -Wl,-rpath,${SRCDIR}/../../../zu/target/release
-#cgo windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu2 -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp
+#cgo windows LDFLAGS: -L${SRCDIR}/../../../zu/target/release -l:zu2.dll.lib
 #include <stdlib.h>
 #include "zu2.h"
 */
