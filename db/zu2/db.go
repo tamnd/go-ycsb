@@ -100,6 +100,12 @@ const (
 	zu2MaxNodes           = "zu2.max_nodes"
 	zu2SpaceTargetPercent = "zu2.space_target_percent"
 	zu2CompactBelow       = "zu2.compact_below"
+	// Sessions the engine makes room for. One per worker thread, held
+	// for the whole run, so the default here is threadcount with a
+	// little headroom rather than the engine's own 128: go-ycsb's
+	// default threadcount is 200 and a run that asks for more sessions
+	// than the engine has room for is refused, not queued.
+	zu2Sessions = "zu2.sessions"
 	// Compact once before the storage line is printed, so the number is
 	// the settled file and not the file mid write. Off by default: the
 	// interesting number is usually what the run left behind.
@@ -180,6 +186,8 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	if v := p.GetUint64(zu2CompactBelow, 0); v != 0 {
 		opt.compact_below = C.uint64_t(v)
 	}
+	threads := p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault)
+	opt.sessions = C.uint64_t(p.GetInt64(zu2Sessions, threads+8))
 
 	cpath := C.CString(d.path)
 	defer C.free(unsafe.Pointer(cpath))
