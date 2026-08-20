@@ -93,13 +93,24 @@ const (
 	// engine defaults to, and a run that wants the fsync comparison
 	// says so rather than getting it by accident.
 	zu2Durability = "zu2.durability"
-	// Sizing hints. index_buckets and max_nodes are sized once and not
-	// grown, so a load that knows its record count should say so.
+	// Sizing hints. The index doubles when it passes half full, so a
+	// hint that is too small costs growths rather than correctness, and
+	// a load that knows its record count still saves those by saying so.
+	// max_nodes is sized once and not grown.
 	zu2IndexBuckets       = "zu2.index_buckets"
 	zu2MaxPages           = "zu2.max_pages"
 	zu2MaxNodes           = "zu2.max_nodes"
 	zu2SpaceTargetPercent = "zu2.space_target_percent"
 	zu2CompactBelow       = "zu2.compact_below"
+	// Pin the index at index_buckets however many keys arrive. Off, so
+	// a sweep gets the engine's own behaviour; on, it is the only way to
+	// measure what a crowded table costs, since a table left to grow
+	// stops being crowded partway through the measurement.
+	zu2FixedIndex = "zu2.fixed_index"
+	// Open a file with a hole in it at the prefix below the hole. Off,
+	// and a run that turns it on is asking to measure a database that is
+	// knowingly short, which the storage line then says out loud.
+	zu2Salvage = "zu2.salvage"
 	// Sessions the engine makes room for. One per worker thread, held
 	// for the whole run, so the default here is threadcount with a
 	// little headroom rather than the engine's own 128: go-ycsb's
@@ -185,6 +196,12 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 	if v := p.GetUint64(zu2CompactBelow, 0); v != 0 {
 		opt.compact_below = C.uint64_t(v)
+	}
+	if p.GetBool(zu2FixedIndex, false) {
+		opt.fixed_index = 1
+	}
+	if p.GetBool(zu2Salvage, false) {
+		opt.salvage = 1
 	}
 	threads := p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault)
 	opt.sessions = C.uint64_t(p.GetInt64(zu2Sessions, threads+8))
@@ -399,10 +416,12 @@ func (db *zu2DB) Close() error {
 	return nil
 }
 
-// printStorage writes the one line that makes this run comparable on
+// printStorage writes the two lines that make this run comparable on
 // space as well as speed. Disk bytes and not file length: compaction
 // punches holes, and a holed file still reports the length that counts
-// them.
+// them. Resident pages beside it, because the filesystem is only half
+// the space question and reporting one without the other is picking
+// whichever number reads better.
 //
 // The index entry count is entries in use and not keys stored. A zu2
 // bucket is eight slots with no overflow pointer, so a key that arrives
@@ -410,6 +429,13 @@ func (db *zu2DB) Close() error {
 // and it stops owning an entry of its own. At the sizing this harness
 // asks for that is a handful of keys in twenty thousand, so the count
 // reads a little under the record count and nothing is missing.
+//
+// The index line is the one that explains a read number. Entries against
+// buckets times eight is the load factor, and a crowded table is why a
+// read walks a chain; growths say whether the table doubled under the
+// run, which costs and which a sweep could previously only infer from
+// the shape of a curve; resizing says a phase ended mid migration, which
+// is a real state to be in and not the steady one.
 func (db *zu2DB) printStorage() {
 	var disk C.uint64_t
 	if st := C.zu2_disk_bytes(db.db, &disk); st != C.ZU2_OK {
@@ -419,10 +445,33 @@ func (db *zu2DB) printStorage() {
 	written := uint64(C.zu2_log_bytes(db.db))
 	span := uint64(C.zu2_log_span(db.db))
 	occupancy := uint64(C.zu2_index_occupancy(db.db))
+	buckets := uint64(C.zu2_index_buckets(db.db))
+	grows := uint64(C.zu2_index_grows(db.db))
+	resizing := uint32(C.zu2_index_resizing(db.db))
+	resident := uint64(C.zu2_resident_pages(db.db))
+	discarded := uint64(C.zu2_discarded(db.db))
 
 	const mib = 1 << 20
-	fmt.Printf("zu2 storage: disk %.1f MiB, log span %.1f MiB, written %.1f MiB, index entries %d\n",
-		float64(disk)/mib, float64(span)/mib, float64(written)/mib, occupancy)
+	const pageBytes = 4 << 20
+	fmt.Printf("zu2 storage: disk %.1f MiB, log span %.1f MiB, written %.1f MiB, resident %.1f MiB (%d pages)\n",
+		float64(disk)/mib, float64(span)/mib, float64(written)/mib,
+		float64(resident*pageBytes)/mib, resident)
+
+	load := 0.0
+	if buckets > 0 {
+		load = float64(occupancy) / float64(buckets*8)
+	}
+	fmt.Printf("zu2 index: %d entries in %d buckets, load %.2f, growths %d, resizing %t\n",
+		occupancy, buckets, load, grows, resizing != 0)
+
+	// Only when there is something to say. A file with a hole in it does
+	// not open at all unless the adapter asked to salvage it, so this is
+	// zero on every ordinary run and printing a zero every time would
+	// train a reader to skip the line that matters.
+	if discarded > 0 {
+		fmt.Printf("zu2 recovery: salvaged, %.1f MiB above a hole discarded\n",
+			float64(discarded)/mib)
+	}
 }
 
 func init() {
