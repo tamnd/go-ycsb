@@ -24,7 +24,7 @@ mkdir -p "$WORK"
 
 ENGINES=("$@")
 if [ "${1:-}" = "all" ] || [ $# -eq 0 ]; then
-  ENGINES=(sqlite duckdb ladybug neo4j pg zu)
+  ENGINES=(sqlite duckdb ladybug neo4j pg zu zu2)
 fi
 
 for e in "${ENGINES[@]}"; do

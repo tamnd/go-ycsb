@@ -1,0 +1,405 @@
+// Copyright 2026 tamnd.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:build zu2
+
+// Package zu2 is the YCSB adapter for zu2, over libzu2.
+//
+// zu2 is a storage engine and not a database with a query language, so
+// this adapter is a key value adapter and looks like db/rocksdb rather
+// than db/zu. A row is one record: the key is table:key and the value is
+// the same TiDB row encoding every other key value engine here uses, so
+// the bytes on the device are comparable across adapters and none of
+// them is being charged for a different serialisation.
+//
+// The engine opens inside the harness process and every operation is a
+// direct call into the library, so nothing in a timed region crosses a
+// process boundary or a socket. Each worker holds its own session for
+// the length of the run, because a session owns an epoch slot and the
+// buffers the read path answers out of, and libzu2 answers
+// ZU2_MISUSE_CONCURRENT rather than corrupting one when two threads use
+// it at once.
+//
+// Scan is not implemented and says so. zu2's index is a hash and its log
+// is in address order, so there is no ordered iteration to hand a range
+// scan, and a scan faked by probing consecutive generated keys would be
+// a different measurement wearing the same name.
+//
+// The graph plane is not exercised here either. YCSB core has no
+// traversal in it, and the traversal comparison lives in
+// tamnd/graph-bench where the rivals are the same engines with their
+// own indexes on an edge table.
+//
+// Build tag: zu2. The cgo lines default to a sibling zu checkout built
+// in release mode, which is the layout the repos are developed in. cgo
+// cannot read the environment, so anything else overrides at build time:
+//
+//	CGO_CFLAGS="-I$ZU2_INCLUDE" \
+//	CGO_LDFLAGS="-L$ZU2_LIB -lzu2 -Wl,-rpath,$ZU2_LIB" \
+//	  go build -tags zu2 ./cmd/go-ycsb
+//
+// Build libzu2 first with cargo build --release -p zu2-capi in the zu
+// repo.
+package zu2
+
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../../zu/crates/zu2-capi/include
+#cgo LDFLAGS: -L${SRCDIR}/../../../zu/target/release -lzu2 -Wl,-rpath,${SRCDIR}/../../../zu/target/release
+#include <stdlib.h>
+#include "zu2.h"
+*/
+import "C"
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"unsafe"
+
+	"github.com/magiconair/properties"
+
+	"github.com/pingcap/go-ycsb/pkg/prop"
+	"github.com/pingcap/go-ycsb/pkg/util"
+	"github.com/pingcap/go-ycsb/pkg/ycsb"
+)
+
+// zu2 properties. Everything that is not set takes the engine's own
+// default, which is what zu2_options_init writes.
+const (
+	zu2Path = "zu2.path"
+	// async or durable. async is the default because it is what the
+	// engine defaults to, and a run that wants the fsync comparison
+	// says so rather than getting it by accident.
+	zu2Durability = "zu2.durability"
+	// Sizing hints. index_buckets and max_nodes are sized once and not
+	// grown, so a load that knows its record count should say so.
+	zu2IndexBuckets       = "zu2.index_buckets"
+	zu2MaxPages           = "zu2.max_pages"
+	zu2MaxNodes           = "zu2.max_nodes"
+	zu2SpaceTargetPercent = "zu2.space_target_percent"
+	zu2CompactBelow       = "zu2.compact_below"
+	// Compact once before the storage line is printed, so the number is
+	// the settled file and not the file mid write. Off by default: the
+	// interesting number is usually what the run left behind.
+	zu2CompactOnClose = "zu2.compact_on_close"
+	zu2StorageReport  = "zu2.storage_report"
+)
+
+type zu2Creator struct{}
+
+// session is one libzu2 session plus the scratch it writes through. A
+// session may move between threads but must not be in two callers'
+// hands at once, which is why each worker keeps its own for the length
+// of the run.
+type session struct {
+	s *C.zu2_session
+	// Row key scratch, so building table:key costs no allocation.
+	key []byte
+	// Row value scratch for the encoder.
+	buf []byte
+}
+
+type zu2DB struct {
+	p *properties.Properties
+
+	db   *C.zu2_db
+	path string
+
+	r *util.RowCodec
+
+	durability C.zu2_durability
+	report     bool
+	compactEnd bool
+
+	mu       sync.Mutex
+	sessions []*session // every session opened, so Close can free them
+}
+
+type ctxKey struct{}
+
+func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
+	d := new(zu2DB)
+	d.p = p
+	d.r = util.NewRowCodec(p)
+	d.path = p.GetString(zu2Path, "/tmp/ycsb.zu2")
+	d.report = p.GetBool(zu2StorageReport, true)
+	d.compactEnd = p.GetBool(zu2CompactOnClose, false)
+
+	switch strings.ToLower(p.GetString(zu2Durability, "async")) {
+	case "async":
+		d.durability = C.ZU2_ASYNC
+	case "durable":
+		d.durability = C.ZU2_DURABLE
+	default:
+		return nil, fmt.Errorf("zu2: %s must be async or durable", zu2Durability)
+	}
+
+	if p.GetBool(prop.DropData, prop.DropDataDefault) {
+		os.RemoveAll(d.path)
+	}
+
+	var opt C.zu2_options
+	if st := C.zu2_options_init(&opt); st != C.ZU2_OK {
+		return nil, fmt.Errorf("zu2: options init failed with status %d", int(st))
+	}
+	opt.durability = d.durability
+	if v := p.GetUint64(zu2IndexBuckets, 0); v != 0 {
+		opt.index_buckets = C.uint64_t(v)
+	}
+	if v := p.GetUint64(zu2MaxPages, 0); v != 0 {
+		opt.max_pages = C.uint64_t(v)
+	}
+	if v := p.GetUint64(zu2MaxNodes, 0); v != 0 {
+		opt.max_nodes = C.uint64_t(v)
+	}
+	if v := p.GetUint64(zu2SpaceTargetPercent, 0); v != 0 {
+		opt.space_target_percent = C.uint32_t(v)
+	}
+	if v := p.GetUint64(zu2CompactBelow, 0); v != 0 {
+		opt.compact_below = C.uint64_t(v)
+	}
+
+	cpath := C.CString(d.path)
+	defer C.free(unsafe.Pointer(cpath))
+
+	var cerr *C.char
+	var cerrLen C.size_t
+	st := C.zu2_open(cpath, C.size_t(len(d.path)), &opt, &d.db, &cerr, &cerrLen)
+	if st != C.ZU2_OK {
+		msg := ""
+		if cerr != nil {
+			msg = ": " + C.GoStringN(cerr, C.int(cerrLen))
+		}
+		return nil, fmt.Errorf("zu2: open %q failed with status %d%s", d.path, int(st), msg)
+	}
+	return d, nil
+}
+
+// newSession opens a session at the run's durability and records it for
+// Close.
+func (db *zu2DB) newSession() (*session, error) {
+	var s *C.zu2_session
+	if st := C.zu2_session_open(db.db, &s); st != C.ZU2_OK {
+		return nil, dbErr(db.db, st, "zu2: session open failed")
+	}
+	if st := C.zu2_set_durability(s, db.durability); st != C.ZU2_OK {
+		C.zu2_session_close(s)
+		return nil, fmt.Errorf("zu2: set durability failed with status %d", int(st))
+	}
+
+	out := &session{s: s, key: make([]byte, 0, 64), buf: make([]byte, 0, 1024)}
+	db.mu.Lock()
+	db.sessions = append(db.sessions, out)
+	db.mu.Unlock()
+	return out, nil
+}
+
+// InitThread gives each worker its own session.
+func (db *zu2DB) InitThread(ctx context.Context, _ int, _ int) context.Context {
+	s, err := db.newSession()
+	if err != nil {
+		panic(err)
+	}
+	return context.WithValue(ctx, ctxKey{}, s)
+}
+
+// CleanupThread leaves the session to Close. A worker's context is gone
+// by the time the run reports, and closing here would race the storage
+// line against sessions that are still finishing.
+func (db *zu2DB) CleanupThread(_ context.Context) {}
+
+func sessionOf(ctx context.Context) *session {
+	s, _ := ctx.Value(ctxKey{}).(*session)
+	return s
+}
+
+// rowKey builds table:key in the session's scratch. Same shape as the
+// other key value adapters here, so a record costs the same key bytes
+// whichever engine is holding it.
+func (s *session) rowKey(table, key string) []byte {
+	s.key = append(s.key[:0], table...)
+	s.key = append(s.key, ':')
+	s.key = append(s.key, key...)
+	return s.key
+}
+
+// ptr hands C the start of a Go slice. libzu2 copies what it is given
+// before it returns, so nothing here is retained across the call, which
+// is the rule cgo cares about.
+func ptr(b []byte) *C.uint8_t {
+	if len(b) == 0 {
+		return nil
+	}
+	return (*C.uint8_t)(unsafe.Pointer(&b[0]))
+}
+
+// sessionErr turns a failed status and the session's last error into a
+// Go error.
+func sessionErr(s *C.zu2_session, st C.zu2_status, fallback string) error {
+	var n C.size_t
+	if p := C.zu2_session_error(s, &n); p != nil && n > 0 {
+		return fmt.Errorf("%s: %s", fallback, C.GoStringN(p, C.int(n)))
+	}
+	return fmt.Errorf("%s (status %d)", fallback, int(st))
+}
+
+func dbErr(db *C.zu2_db, st C.zu2_status, fallback string) error {
+	var n C.size_t
+	if p := C.zu2_db_error(db, &n); p != nil && n > 0 {
+		return fmt.Errorf("%s: %s", fallback, C.GoStringN(p, C.int(n)))
+	}
+	return fmt.Errorf("%s (status %d)", fallback, int(st))
+}
+
+func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	s := sessionOf(ctx)
+	rk := s.rowKey(table, key)
+
+	var val *C.uint8_t
+	var valLen C.size_t
+	var found C.int
+	st := C.zu2_read(s.s, ptr(rk), C.size_t(len(rk)), &val, &valLen, &found)
+	if st != C.ZU2_OK {
+		return nil, sessionErr(s.s, st, fmt.Sprintf("zu2: read %q failed", key))
+	}
+	if found == 0 {
+		return nil, nil
+	}
+
+	// A copy, and it has to be. The buffer belongs to the session and
+	// is valid only until the next call on it, and the row decoder
+	// hands back sub slices of whatever it is given, so decoding in
+	// place would leave the caller holding windows into a buffer the
+	// next read overwrites.
+	row := C.GoBytes(unsafe.Pointer(val), C.int(valLen))
+	return db.r.Decode(row, fields)
+}
+
+// Scan is not supported. zu2 indexes by hash and logs in address order,
+// so there is no ordered iteration under this, and probing consecutive
+// generated keys would report a number for a scan that never happened.
+func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	return nil, fmt.Errorf("zu2: scan is not supported, the index is a hash and the log is not key ordered")
+}
+
+func (db *zu2DB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+	m, err := db.Read(ctx, table, key, nil)
+	if err != nil {
+		return err
+	}
+	if m == nil {
+		m = make(map[string][]byte, len(values))
+	}
+	for field, value := range values {
+		m[field] = value
+	}
+	return db.write(ctx, table, key, m)
+}
+
+func (db *zu2DB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
+	return db.write(ctx, table, key, values)
+}
+
+// write encodes a row and upserts it. Insert and Update are the same
+// call underneath, because zu2 has one write and it does not care
+// whether the key was there.
+func (db *zu2DB) write(ctx context.Context, table string, key string, values map[string][]byte) error {
+	s := sessionOf(ctx)
+
+	buf, err := db.r.Encode(s.buf[:0], values)
+	if err != nil {
+		return err
+	}
+	s.buf = buf
+
+	rk := s.rowKey(table, key)
+	st := C.zu2_upsert(s.s, ptr(rk), C.size_t(len(rk)), ptr(buf), C.size_t(len(buf)))
+	if st != C.ZU2_OK {
+		return sessionErr(s.s, st, fmt.Sprintf("zu2: upsert %q failed", key))
+	}
+	return nil
+}
+
+func (db *zu2DB) Delete(ctx context.Context, table string, key string) error {
+	s := sessionOf(ctx)
+	rk := s.rowKey(table, key)
+
+	var existed C.int
+	st := C.zu2_delete(s.s, ptr(rk), C.size_t(len(rk)), &existed)
+	if st != C.ZU2_OK {
+		return sessionErr(s.s, st, fmt.Sprintf("zu2: delete %q failed", key))
+	}
+	return nil
+}
+
+func (db *zu2DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// Sessions first. They hold epoch slots, and the storage numbers
+	// below are only honest once nothing is still writing.
+	for _, s := range db.sessions {
+		C.zu2_session_close(s.s)
+	}
+	db.sessions = nil
+
+	// An async run leaves a tail in memory, and a file measured before
+	// that tail lands is smaller than the data it is holding.
+	if st := C.zu2_sync(db.db); st != C.ZU2_OK {
+		err := dbErr(db.db, st, "zu2: sync failed")
+		C.zu2_close(db.db)
+		db.db = nil
+		return err
+	}
+	if db.compactEnd {
+		var reclaimed C.uint64_t
+		if st := C.zu2_compact(db.db, &reclaimed); st != C.ZU2_OK {
+			err := dbErr(db.db, st, "zu2: compact failed")
+			C.zu2_close(db.db)
+			db.db = nil
+			return err
+		}
+	}
+	if db.report {
+		db.printStorage()
+	}
+
+	C.zu2_close(db.db)
+	db.db = nil
+	return nil
+}
+
+// printStorage writes the one line that makes this run comparable on
+// space as well as speed. Disk bytes and not file length: compaction
+// punches holes, and a holed file still reports the length that counts
+// them.
+func (db *zu2DB) printStorage() {
+	var disk C.uint64_t
+	if st := C.zu2_disk_bytes(db.db, &disk); st != C.ZU2_OK {
+		fmt.Printf("zu2 storage: unavailable, %v\n", dbErr(db.db, st, "disk bytes failed"))
+		return
+	}
+	written := uint64(C.zu2_log_bytes(db.db))
+	span := uint64(C.zu2_log_span(db.db))
+	occupancy := uint64(C.zu2_index_occupancy(db.db))
+
+	const mib = 1 << 20
+	fmt.Printf("zu2 storage: disk %.1f MiB, log span %.1f MiB, written %.1f MiB, index entries %d\n",
+		float64(disk)/mib, float64(span)/mib, float64(written)/mib, occupancy)
+}
+
+func init() {
+	ycsb.RegisterDBCreator("zu2", zu2Creator{})
+}

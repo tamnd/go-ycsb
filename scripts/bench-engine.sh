@@ -66,6 +66,14 @@ case "$ENGINE" in
   zu)
     ENGINE_ARGS=(-p "zu.dbpath=$DATA.zu1")
     ;;
+  zu2)
+    # index_buckets sized off the record count, because zu2 sizes the
+    # index once and does not grow it, and eight entries to a bucket
+    # wants to stay under half full. Everything else takes the engine's
+    # default, which is the async commit every other engine here is also
+    # running at.
+    ENGINE_ARGS=(-p "zu2.path=$DATA.zu2" -p "zu2.index_buckets=$((RECORDS / 4 + 1))")
+    ;;
 esac
 
 # Wipe whatever the previous workload left behind. Only paths this script
@@ -76,6 +84,7 @@ reset_data() {
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
     ladybug) rm -rf "$DATA.lbug" ;;
     zu)      rm -rf "$DATA.zu1" ;;
+    zu2)     rm -rf "$DATA.zu2" ;;
     pg|neo4j) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
 }
@@ -128,21 +137,35 @@ emit() {  # emit <workload> <phase> <output>
   done <<<"$out" | tee -a "$OUT"
 }
 
+# Workload E is short range scans. zu2 has no ordered iteration under it,
+# its index is a hash, and its adapter says so rather than faking one, so
+# the workload is skipped with a line in the file instead of filling a row
+# with an error rate.
+SKIP=""
+case "$ENGINE" in
+  zu2) SKIP="e" ;;
+esac
+
 for w in a b c d e f; do
+  if [[ " $SKIP " == *" $w "* ]]; then
+    echo "# workload $w skipped: $ENGINE does not support scan" | tee -a "$OUT"
+    continue
+  fi
+
   reset_data
 
-  load_out=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" "${LOAD_ARGS[@]}" \
+  load_out=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1 \
     | grep -E '^(INSERT|TOTAL) ')
   if [ -z "$load_out" ]; then
     echo "# load failed for workload $w, see $WORK/$ENGINE-fail-$w.log" | tee -a "$OUT"
-    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" "${LOAD_ARGS[@]}" \
+    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
       -p recordcount="$RECORDS" -p threadcount="$THREADS" > "$WORK/$ENGINE-fail-$w.log" 2>&1
     continue
   fi
   emit "$w" load "$load_out"
 
-  run_out=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]}" \
+  run_out=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
     -p threadcount="$THREADS" 2>&1 \
     | grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ')

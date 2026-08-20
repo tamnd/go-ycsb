@@ -84,6 +84,8 @@ import (
 	_ "github.com/pingcap/go-ycsb/db/neo4j"
 	// Register zu database
 	_ "github.com/pingcap/go-ycsb/db/zu"
+	// Register zu2 database
+	_ "github.com/pingcap/go-ycsb/db/zu2"
 	// Register s3 database
 	_ "github.com/pingcap/go-ycsb/db/s3"
 )
