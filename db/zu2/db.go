@@ -423,14 +423,17 @@ func (db *zu2DB) Close() error {
 // the space question and reporting one without the other is picking
 // whichever number reads better.
 //
-// The index entry count is entries in use and not keys stored. A zu2
-// bucket is eight slots with no overflow pointer, so a key that arrives
-// at a full bucket takes an entry over and chains behind it in the log,
-// and it stops owning an entry of its own. At the sizing this harness
-// asks for that is a handful of keys in twenty thousand, so the count
-// reads a little under the record count and nothing is missing.
+// The index count is slots in use and not keys stored. A zu2 bucket is
+// eight slots with no overflow pointer, so a key that arrives at a full
+// bucket takes a slot over and chains behind it in the log, and it stops
+// owning a slot of its own. The line used to call them entries, which
+// reads as records having gone missing: a load of 100000 printed 99793
+// and the 207 were displaced rather than lost, which took a million
+// reads over the same keys to establish (tamnd/zu#486). It says slots
+// now, and it says how many of them carry more than one key, which is
+// the crowding a read actually pays for.
 //
-// The index line is the one that explains a read number. Entries against
+// The index line is the one that explains a read number. Slots against
 // buckets times eight is the load factor, and a crowded table is why a
 // read walks a chain; growths say whether the table doubled under the
 // run, which costs and which a sweep could previously only infer from
@@ -445,6 +448,7 @@ func (db *zu2DB) printStorage() {
 	written := uint64(C.zu2_log_bytes(db.db))
 	span := uint64(C.zu2_log_span(db.db))
 	occupancy := uint64(C.zu2_index_occupancy(db.db))
+	foreign := uint64(C.zu2_index_foreign(db.db))
 	buckets := uint64(C.zu2_index_buckets(db.db))
 	grows := uint64(C.zu2_index_grows(db.db))
 	resizing := uint32(C.zu2_index_resizing(db.db))
@@ -457,12 +461,13 @@ func (db *zu2DB) printStorage() {
 		float64(disk)/mib, float64(span)/mib, float64(written)/mib,
 		float64(resident*pageBytes)/mib, resident)
 
+	slots := buckets * 8
 	load := 0.0
-	if buckets > 0 {
-		load = float64(occupancy) / float64(buckets*8)
+	if slots > 0 {
+		load = float64(occupancy) / float64(slots)
 	}
-	fmt.Printf("zu2 index: %d entries in %d buckets, load %.2f, growths %d, resizing %t\n",
-		occupancy, buckets, load, grows, resizing != 0)
+	fmt.Printf("zu2 index: %d of %d slots in use, load %.2f, %d carrying more than one key, growths %d, resizing %t\n",
+		occupancy, slots, load, foreign, grows, resizing != 0)
 
 	// Only when there is something to say. A file with a hole in it does
 	// not open at all unless the adapter asked to salvage it, so this is
