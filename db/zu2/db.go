@@ -136,6 +136,11 @@ type session struct {
 	key []byte
 	// Row value scratch for the encoder.
 	buf []byte
+	// Where the batch path stages, kept per session so a load of a
+	// million rows allocates a handful of times and not per batch.
+	arena carena
+	pairs cpairs
+	off   []int
 }
 
 type zu2DB struct {
@@ -280,6 +285,86 @@ func ptr(b []byte) *C.uint8_t {
 	return (*C.uint8_t)(unsafe.Pointer(&b[0]))
 }
 
+// carena is C memory the batch path stages keys and values into.
+//
+// cgo's pointer rules are the reason it exists rather than an array of
+// zu2_pair pointing straight at Go slices: memory handed to C may not
+// itself hold Go pointers, and every entry of a batch is two of them.
+// So a batch copies into C memory once and the array points inside
+// that. libzu2 copies again into the log, and both copies together are
+// still cheaper than what the staging buys, which is one crossing for a
+// whole batch instead of one per row.
+type carena struct {
+	base unsafe.Pointer
+	len  int
+	cap  int
+}
+
+func (a *carena) reset() { a.len = 0 }
+
+// put copies b in and returns where it landed. An offset and not a
+// pointer, because the block moves when a later put grows it.
+func (a *carena) put(b []byte) int {
+	off := a.len
+	if len(b) == 0 {
+		return off
+	}
+	if a.len+len(b) > a.cap {
+		next := a.cap*2 + len(b)
+		if next < 4096 {
+			next = 4096
+		}
+		p := C.realloc(a.base, C.size_t(next))
+		if p == nil {
+			panic("zu2: out of memory staging a batch")
+		}
+		a.base, a.cap = p, next
+	}
+	copy(unsafe.Slice((*byte)(a.base), a.cap)[off:], b)
+	a.len += len(b)
+	return off
+}
+
+// at is where an offset ended up, once the block has stopped moving.
+func (a *carena) at(off int) *C.uint8_t {
+	if a.base == nil {
+		return nil
+	}
+	return (*C.uint8_t)(unsafe.Add(a.base, off))
+}
+
+func (a *carena) free() {
+	if a.base != nil {
+		C.free(a.base)
+		a.base, a.len, a.cap = nil, 0, 0
+	}
+}
+
+// cpairs is the zu2_pair array itself, in C memory for the same reason
+// and grown the same way.
+type cpairs struct {
+	base unsafe.Pointer
+	cap  int
+}
+
+func (p *cpairs) reserve(n int) []C.zu2_pair {
+	if n > p.cap {
+		q := C.realloc(p.base, C.size_t(n)*C.size_t(unsafe.Sizeof(C.zu2_pair{})))
+		if q == nil {
+			panic("zu2: out of memory staging a batch")
+		}
+		p.base, p.cap = q, n
+	}
+	return unsafe.Slice((*C.zu2_pair)(p.base), p.cap)[:n]
+}
+
+func (p *cpairs) free() {
+	if p.base != nil {
+		C.free(p.base)
+		p.base, p.cap = nil, 0
+	}
+}
+
 // sessionErr turns a failed status and the session's last error into a
 // Go error.
 func sessionErr(s *C.zu2_session, st C.zu2_status, fallback string) error {
@@ -367,6 +452,89 @@ func (db *zu2DB) write(ctx context.Context, table string, key string, values map
 	return nil
 }
 
+// BatchInsert stages n rows and writes them in one call.
+//
+// Two things are being saved. One is the crossing: cgo charges for
+// every call into C, and a row at a time load pays it a million times
+// for a million rows. The other is the wait, since a durable session
+// waits for the device on every upsert, and a loader wants the batch on
+// disk rather than each row on disk before the next one starts.
+// zu2_upsert_many waits once for the whole array.
+//
+// The staging is not free, but it is the price of cgo's pointer rules
+// rather than a choice: see carena.
+func (db *zu2DB) BatchInsert(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	s := sessionOf(ctx)
+	s.arena.reset()
+	pairs := s.pairs.reserve(len(keys))
+	off := s.off[:0]
+
+	for i, key := range keys {
+		buf, err := db.r.Encode(s.buf[:0], values[i])
+		if err != nil {
+			return err
+		}
+		s.buf = buf
+		rk := s.rowKey(table, key)
+		off = append(off, s.arena.put(rk), s.arena.put(buf))
+		pairs[i].key_len = C.size_t(len(rk))
+		pairs[i].value_len = C.size_t(len(buf))
+	}
+	s.off = off
+
+	// Pointers last. The block moves while it fills, so anything taken
+	// during the loop above would point into memory realloc has freed.
+	for i := range keys {
+		pairs[i].key = s.arena.at(off[2*i])
+		pairs[i].value = s.arena.at(off[2*i+1])
+	}
+
+	var written C.size_t
+	st := C.zu2_upsert_many(s.s, (*C.zu2_pair)(s.pairs.base), C.size_t(len(keys)), &written)
+	if st != C.ZU2_OK {
+		return sessionErr(s.s, st, fmt.Sprintf("zu2: batch of %d rows stopped after %d", len(keys), int(written)))
+	}
+	return nil
+}
+
+// The rest of BatchDB, a row at a time. Reads and deletes have nothing
+// to batch here, since each one is its own probe, and an update is a
+// read then a write. They are here because BatchDB is one interface and
+// the harness asserts against the whole of it.
+
+func (db *zu2DB) BatchRead(ctx context.Context, table string, keys []string, fields []string) ([]map[string][]byte, error) {
+	out := make([]map[string][]byte, 0, len(keys))
+	for _, k := range keys {
+		row, err := db.Read(ctx, table, k, fields)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func (db *zu2DB) BatchUpdate(ctx context.Context, table string, keys []string, values []map[string][]byte) error {
+	for i, k := range keys {
+		if err := db.Update(ctx, table, k, values[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *zu2DB) BatchDelete(ctx context.Context, table string, keys []string) error {
+	for _, k := range keys {
+		if err := db.Delete(ctx, table, k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (db *zu2DB) Delete(ctx context.Context, table string, key string) error {
 	s := sessionOf(ctx)
 	rk := s.rowKey(table, key)
@@ -387,6 +555,8 @@ func (db *zu2DB) Close() error {
 	// below are only honest once nothing is still writing.
 	for _, s := range db.sessions {
 		C.zu2_session_close(s.s)
+		s.arena.free()
+		s.pairs.free()
 	}
 	db.sessions = nil
 
@@ -482,3 +652,6 @@ func (db *zu2DB) printStorage() {
 func init() {
 	ycsb.RegisterDBCreator("zu2", zu2Creator{})
 }
+
+var _ ycsb.DB = (*zu2DB)(nil)
+var _ ycsb.BatchDB = (*zu2DB)(nil)
