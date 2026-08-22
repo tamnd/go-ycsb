@@ -165,6 +165,62 @@ space() {  # space <workload> <phase>
   return 0
 }
 
+# What the engine actually holds, counted rather than assumed.
+#
+# It exists because of a number that did not add up. duckdb reported 8.5
+# MiB on device after a load of 100000 records of about a kilobyte each,
+# which is 89 bytes a record, and YCSB values are uniform draws from 52
+# letters, so no compressor can go below about 71 percent of the payload.
+# Either the storage line was wrong or the load was, and the harness had
+# no way to say which, because it took the ops count the client reported
+# as proof that the rows arrived. It is not proof: a client counts calls
+# that returned without an error, and a row that never landed is a row
+# nobody asked about again.
+#
+# So this asks the engine. Where the engine has no client on this host
+# the line is left out rather than guessed at, and where it answers a
+# number other than the record count the line says so loudly, because
+# every other row in the file is meaningless if this one is wrong.
+rows() {  # rows <workload> <phase>
+  local n=""
+  case "$ENGINE" in
+    sqlite)
+      command -v sqlite3 >/dev/null 2>&1 &&
+        n=$(sqlite3 "$DATA.db" 'select count(*) from usertable' 2>/dev/null)
+      ;;
+    duckdb)
+      command -v duckdb >/dev/null 2>&1 &&
+        n=$(duckdb "$DATA.db" -noheader -list 'select count(*) from usertable' 2>/dev/null)
+      ;;
+    pg)
+      command -v psql >/dev/null 2>&1 &&
+        n=$(PGPASSWORD="${PGPASSWORD:-benchpass}" psql -qtAX \
+              -h "${PGHOST:-127.0.0.1}" -p "${PGPORT:-55432}" \
+              -U "${PGUSER:-postgres}" -d "${PGDATABASE:-ycsb}" \
+              -c 'select count(*) from usertable' 2>/dev/null)
+      ;;
+    neo4j)
+      command -v cypher-shell >/dev/null 2>&1 &&
+        n=$(cypher-shell -a "${NEO4J_URI:-bolt://127.0.0.1:7687}" \
+              -u "${NEO4J_USER:-neo4j}" -p "${NEO4J_PASSWORD:-benchpass}" \
+              --format plain 'match (r:usertable) return count(r)' 2>/dev/null | tail -1)
+      ;;
+    zu|zu2)
+      # These print their own index occupancy on the storage line, which
+      # is the same question asked of the plane that answers reads.
+      return 0
+      ;;
+  esac
+  n="${n//[[:space:]]/}"
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$n" -eq "$RECORDS" ]; then
+    echo "# $1 $2: $ENGINE holds $n rows, which is the record count" | tee -a "$OUT"
+  else
+    echo "# $1 $2: WRONG, $ENGINE holds $n rows and the load asked for $RECORDS" | tee -a "$OUT"
+  fi
+  return 0
+}
+
 # Nothing is skipped any more. zu2 used to skip workload E because it had
 # no ordered iteration to hand a range scan, and since tamnd/zu#548 it has
 # a scan plane, which is a key ordered structure beside the hash index. It
@@ -199,6 +255,7 @@ for w in a b c d e f; do
   emit "$w" load "$load_out"
   storage "$w" load "$raw"
   space "$w" load
+  rows "$w" load
 
   raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
