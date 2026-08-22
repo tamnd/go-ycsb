@@ -261,6 +261,16 @@ for w in a b c d e f; do
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
     -p threadcount="$THREADS" 2>&1)
   run_out=$(grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ' <<<"$raw")
+  # The same courtesy the load phase gets. A run that produced nothing
+  # used to emit a row of empty columns and throw its output away, which
+  # left a reader with a blank line and no way to find out why, and that
+  # is exactly the case somebody wants the output for.
+  if [ -z "$run_out" ]; then
+    echo "# run produced nothing for workload $w, see $WORK/$ENGINE-runfail-$w.log" | tee -a "$OUT"
+    printf '%s\n' "$raw" > "$WORK/$ENGINE-runfail-$w.log"
+    space "$w" run
+    continue
+  fi
   emit "$w" run "$run_out"
   storage "$w" run "$raw"
   space "$w" run
