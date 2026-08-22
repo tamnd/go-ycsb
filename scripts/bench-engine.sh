@@ -116,7 +116,14 @@ reset_data() {
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
     ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
     zu)      rm -rf "$DATA.zu1" ;;
-    zu2)     rm -rf "$DATA.zu2" ;;
+    # A zu2 database is a log and three sidecars beside it, and removing
+    # the log alone leaves the previous workload's checkpoint and cold
+    # file where the next one's log lands. tamnd/zu#608. The engine takes
+    # them away itself now, and they are named here as well because the
+    # space column counts every path under $DATA.* and a leftover file
+    # would be charged to the workload that did not write it.
+    zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
+                   "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
     pg|neo4j) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
 }
