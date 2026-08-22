@@ -133,6 +133,13 @@ const (
 	// Workload e turns it on; the others do not, and their storage line
 	// then shows what the plane is not costing them.
 	zu2Ordered = "zu2.ordered"
+	// Put a cold record back in the log when a read finds it there. On,
+	// because the tier's rule for cold is a lap of the log without a
+	// write and a read only workload never writes, so without this the
+	// records a run reads most are the ones it reads from the device
+	// forever. Off is the A/B, and the storage line says how many
+	// records promotion moved either way.
+	zu2Promote = "zu2.promote"
 )
 
 type zu2Creator struct{}
@@ -221,6 +228,9 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 	if p.GetBool(zu2Ordered, false) {
 		opt.ordered = 1
+	}
+	if !p.GetBool(zu2Promote, true) {
+		opt.no_promote_reads = 1
 	}
 	threads := p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault)
 	opt.sessions = C.uint64_t(p.GetInt64(zu2Sessions, threads+8))
@@ -707,6 +717,15 @@ func (db *zu2DB) printStorage() {
 		}
 		fmt.Printf("zu2 scan plane: %.1f MiB of memory over %d keys, %.1f bytes a key\n",
 			float64(planeBytes)/mib, keys, each)
+	}
+
+	// What the reads did to the cold tier. Zero on a run with no tier,
+	// on a run with promotion turned off, and on a run whose reads never
+	// reached the tier, and the three are different things: the first
+	// two are settings this line does not repeat and the third is a
+	// result. See zu2.promote.
+	if promoted := uint64(C.zu2_promoted(db.db)); promoted > 0 {
+		fmt.Printf("zu2 promotion: %d records moved out of the cold tier by a read\n", promoted)
 	}
 
 	// Only when there is something to say. A file with a hole in it does

@@ -144,8 +144,14 @@ emit() {  # emit <workload> <phase> <output>
 # It goes in as a comment because it is one line a phase and not a row.
 storage() {  # storage <workload> <phase> <output>
   local note
-  note="$(grep -E '^[a-z0-9]+ storage: ' <<<"$3" | tail -1)"
-  [ -n "$note" ] && echo "# $1 $2: $note" | tee -a "$OUT"
+  # Every line the adapter offers and not just the first. The scan plane
+  # costs memory and the promotions cost writes, and both are printed
+  # beside the disk number for the same reason the disk number is
+  # printed beside the throughput: a result that reports one resource is
+  # picking whichever one reads better.
+  while IFS= read -r note; do
+    [ -n "$note" ] && echo "# $1 $2: $note" | tee -a "$OUT"
+  done < <(grep -E '^[a-z0-9]+ (storage|index|scan plane|promotion|recovery): ' <<<"$3")
   return 0
 }
 
