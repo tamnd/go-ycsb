@@ -114,7 +114,15 @@ reset_data() {
   case "$ENGINE" in
     sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
-    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
+    # Ladybug keeps a write ahead log, a checkpoint of it and two lock
+    # files beside the database, and it refuses to open a path where any
+    # of them is still lying about. Removing the database alone is what
+    # made workload f fail to load on gamingpc at a million records with
+    # nothing but "database init failed" to show for it, on a path whose
+    # database file was already gone.
+    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
+                   "$DATA.lbug.checkpoint.apply.lock" \
+                   "$DATA.lbug.checkpoint.intent.lock" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # A zu2 database is a log and three sidecars beside it, and removing
     # the log alone leaves the previous workload's checkpoint and cold
