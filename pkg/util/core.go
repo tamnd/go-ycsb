@@ -48,33 +48,62 @@ func allFields(p *properties.Properties) []string {
 type RowCodec struct {
 	fieldIndices map[string]int64
 	fields       []string
+	// The field names by column id, which is the reverse of
+	// fieldIndices and is what lets a decode name a column without a
+	// lookup. The ids are dense from zero because createFieldIndices
+	// hands them out that way.
+	fieldNames []string
 }
 
 // NewRowCodec creates the RowCodec
 func NewRowCodec(p *properties.Properties) *RowCodec {
+	indices := createFieldIndices(p)
+	names := make([]string, len(indices))
+	for field, i := range indices {
+		names[i] = field
+	}
 	return &RowCodec{
-		fieldIndices: createFieldIndices(p),
+		fieldIndices: indices,
 		fields:       allFields(p),
+		fieldNames:   names,
 	}
 }
 
 // Decode decodes the row and returns a field-value map
+//
+// One walk of the row rather than a walk into a map[int64][]byte and a
+// copy of that map into this one. The intermediate map was two thirds
+// of the allocations a decoded row cost, and a scan decodes fifty rows,
+// which made it the largest cost in workload E for every engine that
+// keeps rows in this encoding.
 func (r *RowCodec) Decode(row []byte, fields []string) (map[string][]byte, error) {
 	if len(fields) == 0 {
 		fields = r.fields
 	}
 
-	data, err := DecodeRow(row)
+	res := make(map[string][]byte, len(fields))
+	all := len(fields) == len(r.fields)
+	err := EachColumn(row, func(id int64, value []byte) {
+		if id < 0 || int(id) >= len(r.fieldNames) {
+			return
+		}
+		field := r.fieldNames[id]
+		if !all {
+			wanted := false
+			for _, f := range fields {
+				if f == field {
+					wanted = true
+					break
+				}
+			}
+			if !wanted {
+				return
+			}
+		}
+		res[field] = value
+	})
 	if err != nil {
 		return nil, err
-	}
-
-	res := make(map[string][]byte, len(fields))
-	for _, field := range fields {
-		i := r.fieldIndices[field]
-		if v, ok := data[i]; ok {
-			res[field] = v
-		}
 	}
 
 	return res, nil

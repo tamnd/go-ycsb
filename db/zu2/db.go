@@ -75,6 +75,7 @@ package zu2
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -159,6 +160,11 @@ type session struct {
 	arena carena
 	pairs cpairs
 	off   []int
+	// Where a scan's rows are copied to. One buffer per session that
+	// grows to the largest scan and is then reused, instead of a
+	// C.GoBytes per row: workload E returns fifty rows a scan and each
+	// GoBytes is an allocation the collector then has to take back.
+	rows []byte
 }
 
 type zu2DB struct {
@@ -461,14 +467,33 @@ func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count 
 		return nil, nil
 	}
 
-	prefix := table + ":"
+	// The rows are copied into one buffer and the decoded values then
+	// point into it, so the whole scan costs one copy and one growth
+	// rather than a copy and an allocation a row. The buffer belongs to
+	// the session and the next scan on the session overwrites it, which
+	// is the same lifetime the caller already had: the pairs point into
+	// the engine's own scan buffer and that is overwritten too.
+	all := unsafe.Slice(pairs, int(returned))
+	total := 0
+	for _, pair := range all {
+		total += int(pair.value_len)
+	}
+	if cap(s.rows) < total {
+		s.rows = make([]byte, total)
+	}
+	s.rows = s.rows[:total]
+
+	prefix := []byte(table + ":")
 	got := make([]map[string][]byte, 0, int(returned))
-	for _, pair := range unsafe.Slice(pairs, int(returned)) {
-		key := C.GoStringN((*C.char)(unsafe.Pointer(pair.key)), C.int(pair.key_len))
-		if !strings.HasPrefix(key, prefix) {
+	at := 0
+	for _, pair := range all {
+		key := unsafe.Slice((*byte)(unsafe.Pointer(pair.key)), int(pair.key_len))
+		if !bytes.HasPrefix(key, prefix) {
 			break
 		}
-		row := C.GoBytes(unsafe.Pointer(pair.value), C.int(pair.value_len))
+		row := s.rows[at : at+int(pair.value_len)]
+		copy(row, unsafe.Slice((*byte)(unsafe.Pointer(pair.value)), int(pair.value_len)))
+		at += int(pair.value_len)
 		values, err := db.r.Decode(row, fields)
 		if err != nil {
 			return nil, err
