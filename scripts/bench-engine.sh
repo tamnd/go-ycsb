@@ -67,11 +67,12 @@ case "$ENGINE" in
     ENGINE_ARGS=(-p "zu.dbpath=$DATA.zu1")
     ;;
   zu2)
-    # index_buckets sized off the record count, because zu2 sizes the
-    # index once and does not grow it, and eight entries to a bucket
-    # wants to stay under half full. Everything else takes the engine's
-    # default, which is the async commit every other engine here is also
-    # running at.
+    # index_buckets sized off the record count, and eight entries to a
+    # bucket wants to stay under half full. The table does grow under
+    # traffic since Z9, so this is a hint and not a requirement, it just
+    # saves the load phase the doublings it would otherwise take on the
+    # way up. Everything else takes the engine's default, which is the
+    # async commit every other engine here is also running at.
     ENGINE_ARGS=(-p "zu2.path=$DATA.zu2" -p "zu2.index_buckets=$((RECORDS / 4 + 1))")
     ;;
 esac
