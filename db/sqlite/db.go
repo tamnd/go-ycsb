@@ -134,6 +134,17 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		return nil, err
 	}
 
+	// The engine version, in the output, once, for the same reason the
+	// duckdb adapter prints its own: the library is linked in and there
+	// is nothing on the host to ask, so without this line the TSV cannot
+	// say which sqlite produced a row. The build tags decide whether
+	// that is the bundled amalgamation or the system library, and those
+	// are two different engines with two different numbers.
+	var version string
+	if err := d.db.QueryRow("select sqlite_version()").Scan(&version); err == nil {
+		fmt.Printf("sqlite version: %s\n", version)
+	}
+
 	return d, nil
 }
 

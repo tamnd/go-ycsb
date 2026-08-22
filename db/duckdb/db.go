@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/magiconair/properties"
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "github.com/duckdb/duckdb-go/v2"
 
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
@@ -117,6 +117,17 @@ func (c duckdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	if err := d.createTable(); err != nil {
 		db.Close()
 		return nil, err
+	}
+
+	// The engine version, in the output, once. The driver bundles its
+	// own DuckDB, so there is nothing installed on the host to ask and
+	// nothing in the TSV that would say which DuckDB produced a row. A
+	// benchmark that claims to run the latest of every engine has to be
+	// able to show it, and a go.mod line is the driver's version and not
+	// the engine's.
+	var version string
+	if err := d.db.QueryRow("select version()").Scan(&version); err == nil {
+		fmt.Printf("duckdb version: %s\n", version)
 	}
 
 	return d, nil

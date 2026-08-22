@@ -191,6 +191,23 @@ emit() {  # emit <workload> <phase> <output>
 # so far, and the line is what the filesystem is holding rather than the
 # file length, which is the only version of that number worth recording.
 # It goes in as a comment because it is one line a phase and not a row.
+# The engine's own version, said once. sqlite and duckdb link their
+# library in, so there is nothing on the host to ask and a go.mod line
+# is the driver's version and not the engine's. A sweep that claims to
+# run the latest of everything has to be able to show which one it ran,
+# and the adapters print it now, so this lifts it into the header block
+# where the host and the core count are.
+SAID_VERSION=""
+version() {  # version <output>
+  [ -n "$SAID_VERSION" ] && return 0
+  local v
+  v="$(grep -m1 -E '^[a-z0-9]+ version: ' <<<"$1")"
+  [ -z "$v" ] && return 0
+  SAID_VERSION=yes
+  echo "# $v" | tee -a "$OUT"
+  return 0
+}
+
 storage() {  # storage <workload> <phase> <output>
   local note
   # Every line the adapter offers and not just the first. The scan plane
@@ -386,6 +403,7 @@ for w in ${WORKLOADS:-a b c d e f}; do
     continue
   fi
   emit "$w" load "$load_out"
+  version "$raw"
   storage "$w" load "$raw"
   space "$w" load
   rows "$w" load "$raw"
