@@ -329,23 +329,37 @@ func (db *duckdbDB) doInsert(ctx context.Context, tx *sql.Tx, table string, key 
 	// A plain INSERT, and not the OR IGNORE the sqlite adapter uses, and
 	// this is a workaround rather than a preference.
 	//
-	// DuckDB 1.4.1 binds only the first parameter of a prepared INSERT
-	// that carries a conflict clause. Every other parameter comes out
-	// NULL, and nothing is reported: the statement prepares, the row
-	// lands, and the row is a key with ten NULL columns beside it. It is
-	// the clause and not the wording, so OR IGNORE, OR REPLACE and
-	// ON CONFLICT DO NOTHING all do it, with ? or with $1. That is a
-	// silent wrong answer and it invalidated every duckdb number this
-	// harness has produced: a load of 100000 records of a kilobyte each
-	// settled at 8.5 MiB on device, which is 89 bytes a record and is
-	// the key and its index and nothing else, and every read afterwards
-	// was a fast read of a row with no data in it.
+	// DuckDB 1.4.1 matches the column list of an INSERT that carries a
+	// conflict clause case sensitively, and matches it case insensitively
+	// without one. The table is declared with FIELD0 upwards and the
+	// workload hands its fields over as field0 upwards, so
+	// INSERT OR IGNORE INTO usertable (YCSB_KEY, field0, ...) resolved
+	// the key and resolved none of the fields, and the columns that were
+	// not resolved took their default, which is NULL. Nothing was
+	// reported: the statement prepared, the row landed, and the row was a
+	// key with ten NULL columns beside it. It is the clause and not the
+	// wording, so OR IGNORE, OR REPLACE and ON CONFLICT DO NOTHING all do
+	// it, and it does it with literal values as readily as with
+	// parameters, which is what says it is name resolution and not
+	// binding. A table whose key column is NOT NULL and whose key is also
+	// named in the wrong case gets a constraint error instead, which is
+	// how the shape of it was found.
+	//
+	// That is a silent wrong answer and it invalidated every duckdb
+	// number this harness has produced: a load of 100000 records of a
+	// kilobyte each settled at 8.5 MiB on device, which is 89 bytes a
+	// record and is the key and its index and nothing else, and every
+	// read afterwards was a fast read of a row with no data in it.
+	//
+	// DuckDB 1.5.5 answers this correctly. go-duckdb v2.4.3 is the newest
+	// there is and it carries 1.4.1, so the workaround stays until the
+	// bindings carry a 1.5.
 	//
 	// YCSB generates each key once in a load, so a conflict clause was
 	// insurance rather than a requirement. The insurance is taken here
 	// instead, by treating a constraint violation as the no-op OR IGNORE
 	// would have made it, which keeps the semantics the sqlite adapter
-	// has without the clause that breaks the binding.
+	// has without the clause that resolves its columns differently.
 	buf.WriteString("INSERT INTO ")
 	buf.WriteString(table)
 	buf.WriteString(" (YCSB_KEY")
