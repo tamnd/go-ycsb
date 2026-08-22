@@ -30,10 +30,14 @@
 // ZU2_MISUSE_CONCURRENT rather than corrupting one when two threads use
 // it at once.
 //
-// Scan is not implemented and says so. zu2's index is a hash and its log
-// is in address order, so there is no ordered iteration to hand a range
-// scan, and a scan faked by probing consecutive generated keys would be
-// a different measurement wearing the same name.
+// Scan runs over zu2's scan plane, which is a key ordered structure the
+// engine maintains beside the hash index and holds keys only. A scan
+// seeks it once, walks it, and does the ordinary point read for each key
+// it lands on, so what a scan reads is exactly as fresh as what a read
+// reads. The plane is off unless zu2.ordered says otherwise, because it
+// is memory a workload that never scans should not be paying for, and a
+// scan against a database opened without it is an error rather than an
+// empty answer.
 //
 // The graph plane is not exercised here either. YCSB core has no
 // traversal in it, and the traversal comparison lives in
@@ -122,6 +126,13 @@ const (
 	// interesting number is usually what the run left behind.
 	zu2CompactOnClose = "zu2.compact_on_close"
 	zu2StorageReport  = "zu2.storage_report"
+	// Maintain the scan plane, which is what a range scan runs over.
+	// Off by default and it has to be a decision for the whole life of
+	// the data, because the plane is built as records arrive and a
+	// database that ran without it has no key order to hand a scan.
+	// Workload e turns it on; the others do not, and their storage line
+	// then shows what the plane is not costing them.
+	zu2Ordered = "zu2.ordered"
 )
 
 type zu2Creator struct{}
@@ -207,6 +218,9 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 	if p.GetBool(zu2Salvage, false) {
 		opt.salvage = 1
+	}
+	if p.GetBool(zu2Ordered, false) {
+		opt.ordered = 1
 	}
 	threads := p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault)
 	opt.sessions = C.uint64_t(p.GetInt64(zu2Sessions, threads+8))
@@ -407,11 +421,51 @@ func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []st
 	return db.r.Decode(row, fields)
 }
 
-// Scan is not supported. zu2 indexes by hash and logs in address order,
-// so there is no ordered iteration under this, and probing consecutive
-// generated keys would report a number for a scan that never happened.
+// Scan hands back up to count records at or after table:startKey in key
+// order.
+//
+// The row key is table:key, which orders every row of one table together
+// and puts the tables themselves in name order, so a walk that runs off
+// the end of this table lands in the next one. That is what the prefix
+// check is for: the caller asked for rows of a table and gets rows of
+// that table or fewer, never rows of another one.
+//
+// One crossing for the whole scan rather than one per row. The engine
+// fills a buffer of key and value pairs that belongs to the session and
+// lasts exactly until the next call on it, so this copies each value out
+// before it decodes, the same reason Read copies.
 func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	return nil, fmt.Errorf("zu2: scan is not supported, the index is a hash and the log is not key ordered")
+	if count <= 0 {
+		return nil, nil
+	}
+	s := sessionOf(ctx)
+	rk := s.rowKey(table, startKey)
+
+	var pairs *C.zu2_pair
+	var returned C.size_t
+	st := C.zu2_scan(s.s, ptr(rk), C.size_t(len(rk)), C.size_t(count), &pairs, &returned)
+	if st != C.ZU2_OK {
+		return nil, sessionErr(s.s, st, fmt.Sprintf("zu2: scan from %q failed", startKey))
+	}
+	if returned == 0 || pairs == nil {
+		return nil, nil
+	}
+
+	prefix := table + ":"
+	got := make([]map[string][]byte, 0, int(returned))
+	for _, pair := range unsafe.Slice(pairs, int(returned)) {
+		key := C.GoStringN((*C.char)(unsafe.Pointer(pair.key)), C.int(pair.key_len))
+		if !strings.HasPrefix(key, prefix) {
+			break
+		}
+		row := C.GoBytes(unsafe.Pointer(pair.value), C.int(pair.value_len))
+		values, err := db.r.Decode(row, fields)
+		if err != nil {
+			return nil, err
+		}
+		got = append(got, values)
+	}
+	return got, nil
 }
 
 func (db *zu2DB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
@@ -638,6 +692,22 @@ func (db *zu2DB) printStorage() {
 	}
 	fmt.Printf("zu2 index: %d of %d slots in use, load %.2f, %d carrying more than one key, growths %d, resizing %t\n",
 		occupancy, slots, load, foreign, grows, resizing != 0)
+
+	// Only when there is a plane, and it is memory rather than disk: the
+	// plane is rebuilt from the log at open and never written to it, so
+	// it costs the process and not the device. Keys here is every key
+	// the plane was ever told about, which is above the live count by
+	// however many have been deleted, and saying so is the point of
+	// printing both numbers next to each other.
+	if planeBytes := uint64(C.zu2_ordered_bytes(db.db)); planeBytes > 0 {
+		keys := uint64(C.zu2_ordered_keys(db.db))
+		each := 0.0
+		if keys > 0 {
+			each = float64(planeBytes) / float64(keys)
+		}
+		fmt.Printf("zu2 scan plane: %.1f MiB of memory over %d keys, %.1f bytes a key\n",
+			float64(planeBytes)/mib, keys, each)
+	}
 
 	// Only when there is something to say. A file with a hole in it does
 	// not open at all unless the adapter asked to salvage it, so this is

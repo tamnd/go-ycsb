@@ -165,14 +165,13 @@ space() {  # space <workload> <phase>
   return 0
 }
 
-# Workload E is short range scans. zu2 has no ordered iteration under it,
-# its index is a hash, and its adapter says so rather than faking one, so
-# the workload is skipped with a line in the file instead of filling a row
-# with an error rate.
+# Nothing is skipped any more. zu2 used to skip workload E because it had
+# no ordered iteration to hand a range scan, and since tamnd/zu#548 it has
+# a scan plane, which is a key ordered structure beside the hash index. It
+# costs memory, so it is on for workload E and off for the rest, and the
+# storage line then says what it costs where it is on and stays quiet
+# where it is not.
 SKIP=""
-case "$ENGINE" in
-  zu2) SKIP="e" ;;
-esac
 
 for w in a b c d e f; do
   if [[ " $SKIP " == *" $w "* ]]; then
@@ -180,14 +179,20 @@ for w in a b c d e f; do
     continue
   fi
 
+  # Per workload arguments, appended after ENGINE_ARGS so they win.
+  EXTRA=()
+  if [ "$ENGINE" = zu2 ] && [ "$w" = e ]; then
+    EXTRA=(-p "zu2.ordered=true")
+  fi
+
   reset_data
 
-  raw=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
+  raw=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1)
   load_out=$(grep -E '^(INSERT|TOTAL) ' <<<"$raw")
   if [ -z "$load_out" ]; then
     echo "# load failed for workload $w, see $WORK/$ENGINE-fail-$w.log" | tee -a "$OUT"
-    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
+    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
       -p recordcount="$RECORDS" -p threadcount="$THREADS" > "$WORK/$ENGINE-fail-$w.log" 2>&1
     continue
   fi
@@ -195,7 +200,7 @@ for w in a b c d e f; do
   storage "$w" load "$raw"
   space "$w" load
 
-  raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" \
+  raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
     -p threadcount="$THREADS" 2>&1)
   run_out=$(grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ' <<<"$raw")
