@@ -55,6 +55,59 @@ func TestClockStepWithNoMovementIsCoarse(t *testing.T) {
 	}
 }
 
+// What the line says in each of the three cases, on any host. The
+// middle one is the case gamingpc is in and the sentinel it returns must
+// not reach the reader looking like a resolution.
+func TestClockLine(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		step    time.Duration
+		moved   int
+		warns   bool
+		absent  string
+		present string
+	}{
+		{
+			name:    "fine, macOS",
+			step:    41 * time.Nanosecond,
+			moved:   93010,
+			warns:   false,
+			present: "41ns resolution",
+		},
+		{
+			name:    "never moved, gamingpc",
+			step:    time.Hour,
+			moved:   0,
+			warns:   true,
+			absent:  "1h0m0s",
+			present: "coarser than this probe could measure",
+		},
+		{
+			name:    "moved twice, Windows timer tick",
+			step:    517700 * time.Nanosecond,
+			moved:   2,
+			warns:   true,
+			present: "517.7µs resolution",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			line := clockLine(c.step, c.moved, 100000)
+			if got := strings.Contains(line, "must not be quoted"); got != c.warns {
+				t.Fatalf("warns=%v, wanted %v: %q", got, c.warns, line)
+			}
+			if !strings.Contains(line, c.present) {
+				t.Fatalf("no %q in %q", c.present, line)
+			}
+			if c.absent != "" && strings.Contains(line, c.absent) {
+				t.Fatalf("%q reached the output: %q", c.absent, line)
+			}
+			if strings.Contains(line, "\n") {
+				t.Fatalf("the line has a newline in it, the caller adds one: %q", line)
+			}
+		})
+	}
+}
+
 // The threshold has to sit above the operations this harness times or it
 // never fires, and under a timer tick or it always does.
 func TestClockThresholdIsBetweenTheTwoCases(t *testing.T) {

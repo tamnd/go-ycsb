@@ -64,6 +64,28 @@ func clockStep(probes int) (step time.Duration, moved int) {
 	return step, moved
 }
 
+// clockLine is what reportClock says about a probe result. It is split
+// out from the probe so both branches of it can be tested on a host
+// whose clock only produces one of them.
+func clockLine(step time.Duration, moved, probes int) string {
+	if step < clockUsable {
+		return fmt.Sprintf("clock: %v resolution, moved on %d of %d reads", step, moved, probes)
+	}
+	// A clock that never moved has no resolution to report, only the
+	// fact that it is coarser than the probe. Saying so is the honest
+	// line; printing the sentinel would look like a measurement.
+	res := fmt.Sprintf("%v resolution", step)
+	if moved == 0 {
+		res = "resolution coarser than this probe could measure"
+	}
+	return fmt.Sprintf(
+		"clock: %s, moved on %d of %d reads. That is coarser than the operations this run "+
+			"is timing, so the percentile columns below are the clock and not the engine and "+
+			"must not be quoted. The Takes, Count and OPS columns are wall clock over the "+
+			"whole run and are unaffected. See tamnd/zu#649.",
+		res, moved, probes)
+}
+
 // reportClock writes what the host's clock can resolve, and says plainly
 // when it cannot resolve the operations about to be timed.
 //
@@ -79,14 +101,5 @@ func clockStep(probes int) (step time.Duration, moved int) {
 func reportClock(w io.Writer) {
 	const probes = 100000
 	step, moved := clockStep(probes)
-	if step < clockUsable {
-		fmt.Fprintf(w, "clock: %v resolution, moved on %d of %d reads\n", step, moved, probes)
-		return
-	}
-	fmt.Fprintf(w,
-		"clock: %v resolution, moved on %d of %d reads. That is coarser than the operations "+
-			"this run is timing, so the percentile columns below are the clock and not the "+
-			"engine and must not be quoted. The Takes, Count and OPS columns are wall clock "+
-			"over the whole run and are unaffected. See tamnd/zu#649.\n",
-		step, moved, probes)
+	fmt.Fprintln(w, clockLine(step, moved, probes))
 }
