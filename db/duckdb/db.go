@@ -42,6 +42,7 @@ const (
 	duckdbMaxIdleConns   = "duckdb.maxidleconns"
 	duckdbRetries        = "duckdb.retries"
 	duckdbRetryBackoffMs = "duckdb.retry_backoff_ms"
+	duckdbReadTx         = "duckdb.readtx"
 )
 
 type duckdbCreator struct{}
@@ -53,6 +54,7 @@ type duckdbDB struct {
 
 	retries   int
 	backoffMs int
+	readTx    bool
 
 	bufPool *util.BufPool
 }
@@ -112,6 +114,13 @@ func (c duckdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
 	d.retries = p.GetInt(duckdbRetries, 10)
 	d.backoffMs = p.GetInt(duckdbRetryBackoffMs, 2)
+	// A read here is a single SELECT, and a single statement in DuckDB
+	// already runs in its own transaction. Wrapping it in an explicit
+	// BEGIN and COMMIT buys nothing and costs two more statements plus a
+	// trip through the conflict retry loop, which cannot fire on a read
+	// in the first place. Same defect the sqlite adapter had, see
+	// tamnd/zu#647. Set duckdb.readtx=true to get the old shape back.
+	d.readTx = p.GetBool(duckdbReadTx, false)
 	d.bufPool = util.NewBufPool()
 
 	if err := d.createTable(); err != nil {
@@ -129,6 +138,8 @@ func (c duckdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	if err := d.db.QueryRow("select version()").Scan(&version); err == nil {
 		fmt.Printf("duckdb version: %s\n", version)
 	}
+	fmt.Printf("duckdb config: dsn=%q readtx=%v conns=%d\n",
+		dsn, d.readTx, db.Stats().MaxOpenConnections)
 
 	return d, nil
 }
@@ -213,7 +224,14 @@ func (db *duckdbDB) tx(ctx context.Context, f func(tx *sql.Tx) error) error {
 	return lastErr
 }
 
-func (db *duckdbDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
+// querier is the part of *sql.DB and *sql.Tx a read needs. It exists so
+// the read path can run against the pool directly when it is not asked
+// for a transaction.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func (db *duckdbDB) doQueryRows(ctx context.Context, tx querier, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
 	if db.verbose {
 		fmt.Printf("%s %v\n", query, args)
 	}
@@ -248,7 +266,7 @@ func (db *duckdbDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, c
 	return vs, rows.Err()
 }
 
-func (db *duckdbDB) doRead(ctx context.Context, tx *sql.Tx, table string, key string, fields []string) (map[string][]byte, error) {
+func (db *duckdbDB) doRead(ctx context.Context, tx querier, table string, key string, fields []string) (map[string][]byte, error) {
 	sel := "*"
 	if len(fields) > 0 {
 		sel = strings.Join(fields, ",")
@@ -265,6 +283,9 @@ func (db *duckdbDB) doRead(ctx context.Context, tx *sql.Tx, table string, key st
 }
 
 func (db *duckdbDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	if !db.readTx {
+		return db.doRead(ctx, db.db, table, key, fields)
+	}
 	var out map[string][]byte
 	err := db.tx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doRead(ctx, tx, table, key, fields)
@@ -274,7 +295,7 @@ func (db *duckdbDB) Read(ctx context.Context, table string, key string, fields [
 	return out, err
 }
 
-func (db *duckdbDB) doScan(ctx context.Context, tx *sql.Tx, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+func (db *duckdbDB) doScan(ctx context.Context, tx querier, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
 	sel := "*"
 	if len(fields) > 0 {
 		sel = strings.Join(fields, ",")
@@ -290,6 +311,9 @@ func (db *duckdbDB) doScan(ctx context.Context, tx *sql.Tx, table string, startK
 }
 
 func (db *duckdbDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	if !db.readTx {
+		return db.doScan(ctx, db.db, table, startKey, count, fields)
+	}
 	var out []map[string][]byte
 	err := db.tx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doScan(ctx, tx, table, startKey, count, fields)
