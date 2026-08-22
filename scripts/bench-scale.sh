@@ -12,7 +12,7 @@
 #   scripts/bench-scale.sh sqlite 10000 20000 50000
 #   BATCH=1000 scripts/bench-scale.sh zu 10000 20000 50000
 #
-# BATCH sets -p batch.size. Only zu, sqlite and duckdb implement BatchDB,
+# BATCH sets -p batch.size. Only zu, zu2, sqlite and duckdb implement BatchDB,
 # and with it set the harness reports the load as BATCH_INSERT rather
 # than as INSERT, which is why the load row is taken from wall time here
 # instead of from the summary line. A batched number is only comparable
@@ -49,6 +49,11 @@ args_for() {  # args_for <recordcount>
     duckdb)  echo "-p duckdb.dbpath=$DATA.db" ;;
     ladybug) echo "-p ladybug.dbpath=$DATA.lbug" ;;
     zu)      echo "-p zu.dbpath=$DATA.zu1" ;;
+    # The bucket hint is the reason args_for takes the record count at
+    # all. Sizing it per point keeps the table at the same load factor
+    # across the sweep, so the line says how a lookup scales and not how
+    # many times the table doubled on the way to that point.
+    zu2)     echo "-p zu2.path=$DATA.zu2 -p zu2.index_buckets=$(( $1 / 4 + 1 ))" ;;
     pg)      echo "-p pg.host=${PGHOST:-127.0.0.1} -p pg.port=${PGPORT:-55432} -p pg.user=${PGUSER:-postgres} -p pg.password=${PGPASSWORD:-benchpass} -p pg.db=${PGDATABASE:-ycsb} -p pg.sslmode=disable" ;;
     neo4j)   echo "-p neo4j.uri=${NEO4J_URI:-bolt://127.0.0.1:7687} -p neo4j.username=${NEO4J_USER:-neo4j} -p neo4j.password=${NEO4J_PASSWORD:-benchpass}" ;;
   esac
@@ -58,8 +63,15 @@ reset_data() {
   case "$ENGINE" in
     sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
-    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
+    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
+                   "$DATA.lbug.checkpoint.apply.lock" \
+                   "$DATA.lbug.checkpoint.intent.lock" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
+    # Every sidecar, not just the log. The bytes column globs $DATA.* and
+    # a checkpoint from the previous record count would land in the next
+    # point's row. tamnd/zu#610.
+    zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
+                   "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
     pg|neo4j) : ;;  # nothing on this side, dropdata handles it
   esac
 }
@@ -88,7 +100,7 @@ for r in "${RECORDS[@]}"; do
   ARGS=($(args_for "$r"))
 
   start=$(date +%s.%N)
-  load_out=$("$BIN" load "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${DROP[@]}" \
+  load_out=$("$BIN" load "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${DROP[@]+"${DROP[@]}"}" \
     -p recordcount="$r" -p threadcount=1 -p batch.size="$BATCH" 2>&1 \
     | grep -E '^(INSERT|BATCH_INSERT) ' | tail -1)
   end=$(date +%s.%N)
@@ -105,7 +117,10 @@ for r in "${RECORDS[@]}"; do
   # Wall time rather than the summary OPS line, because with batching on
   # the summary counts batches and not rows, and the two are not the same
   # number divided by anything obvious once the last batch is short.
-  wall=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f", b - a }')
+  # Three decimals, not one. A fast engine at a small record count lands
+  # under 0.05s, which at one decimal is 0.0, and then rows_per_s prints
+  # "na" for the fastest point in the sweep.
+  wall=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.3f", b - a }')
   rows=$(awk -v t="$wall" -v r="$r" 'BEGIN { if (t > 0) printf "%.1f", r / t; else print "na" }')
 
   bytes=$(du -sb "$DATA".* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')

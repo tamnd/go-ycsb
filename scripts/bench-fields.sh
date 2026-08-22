@@ -14,6 +14,13 @@
 # Those want different fixes, and one measurement across four fieldcounts
 # tells them apart.
 #
+# zu2 is here as the control rather than as a suspect. It appends a
+# record to a log as one blob and folds nothing, so at a constant payload
+# its per insert cost should not move with fieldcount at all. A zu2 line
+# that does slope says the cost is in the adapter or in the harness's own
+# per field work, which is worth knowing before reading anything into the
+# zu1 line taken on the same host in the same run.
+#
 # The payload is held constant on purpose. fieldlength moves with
 # fieldcount so every row is about the same number of bytes, otherwise a
 # fieldcount sweep is also a payload sweep and neither answer is clean.
@@ -53,6 +60,10 @@ case "$ENGINE" in
   duckdb)  ARGS=(-p duckdb.dbpath="$DATA.db") ;;
   ladybug) ARGS=(-p ladybug.dbpath="$DATA.lbug") ;;
   zu)      ARGS=(-p zu.dbpath="$DATA.zu1") ;;
+  # Sized off the record count like bench-engine.sh does, for the same
+  # reason: the table grows under traffic, so this only saves the load
+  # the doublings it would take on the way up.
+  zu2)     ARGS=(-p zu2.path="$DATA.zu2" -p zu2.index_buckets="$((RECORDS / 4 + 1))") ;;
   pg)      ARGS=(-p pg.host="${PGHOST:-127.0.0.1}" -p pg.port="${PGPORT:-55432}"
                  -p pg.user="${PGUSER:-postgres}" -p pg.password="${PGPASSWORD:-benchpass}"
                  -p pg.db="${PGDATABASE:-ycsb}" -p pg.sslmode=disable) ;;
@@ -69,8 +80,15 @@ reset_data() {
   case "$ENGINE" in
     sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
-    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
+    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
+                   "$DATA.lbug.checkpoint.apply.lock" \
+                   "$DATA.lbug.checkpoint.intent.lock" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
+    # The log plus every sidecar. The bytes column below globs $DATA.*, so
+    # a checkpoint left by the previous fieldcount would be charged to the
+    # next one. tamnd/zu#610.
+    zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
+                   "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
   esac
 }
 
@@ -85,6 +103,18 @@ field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | tail -1; }
   echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } | tee "$OUT"
 
+# One throwaway load before the sweep, discarded. Every point here pays
+# process start, and for a slow engine at two thousand rows that is noise
+# against a load measured in seconds. For zu2 it is not: the first point
+# came out at 94 us a row and the rest at 20, purely because the first
+# one is the one that pages in the shared library and warms the file
+# cache. Read in fieldcount order that looks like a per field cost that
+# falls as fields are added, which is not a thing.
+reset_data
+"$BIN" load "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${DROP[@]+"${DROP[@]}"}" \
+  -p recordcount=100 -p threadcount=1 -p batch.size="$BATCH" \
+  -p fieldcount="${FIELDS[0]}" -p fieldlength=100 >/dev/null 2>&1
+
 printf 'engine\trecords\tfields\tfieldlength\tbatch\tload_s\tus_per_row\tbytes\n' | tee -a "$OUT"
 
 for f in "${FIELDS[@]}"; do
@@ -93,7 +123,7 @@ for f in "${FIELDS[@]}"; do
   [ "$len" -lt 1 ] && len=1
 
   start=$(date +%s.%N)
-  out=$("$BIN" load "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${DROP[@]}" \
+  out=$("$BIN" load "$ENGINE" -P workloads/workloadc "${ARGS[@]}" "${DROP[@]+"${DROP[@]}"}" \
     -p recordcount="$RECORDS" -p threadcount=1 -p batch.size="$BATCH" \
     -p fieldcount="$f" -p fieldlength="$len" 2>&1 \
     | grep -E '^(INSERT|BATCH_INSERT) ' | tail -1)
@@ -101,7 +131,10 @@ for f in "${FIELDS[@]}"; do
 
   [ -z "$out" ] && echo "load failed for $ENGINE at fieldcount $f" >&2
 
-  wall=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.1f", b - a }')
+  # Three decimals, not one. zu2 loads two thousand rows in under a
+  # twentieth of a second, which at one decimal is 0.0, and 0.0 divides
+  # into a per row cost of zero. A row of zeroes reads like a result.
+  wall=$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.3f", b - a }')
   per=$(awk -v t="$wall" -v r="$RECORDS" 'BEGIN { if (r > 0) printf "%.0f", t * 1000000 / r; else print "na" }')
   bytes=$(du -sb "$DATA".* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')
 
