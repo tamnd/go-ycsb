@@ -24,8 +24,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/magiconair/properties"
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/magiconair/properties"
 
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
