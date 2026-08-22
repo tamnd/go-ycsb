@@ -25,6 +25,24 @@ THREADS="${3:-1}"
 # Not /tmp. On gamingpc this runs inside WSL, WSL tears the VM down when
 # it goes idle, and /tmp is tmpfs, so results written there vanish.
 WORK="${WORK:-$PWD/.bench}"
+
+# One benchmark at a time per work directory. Every engine here writes
+# to a fixed path under $WORK, so two runs started by mistake share the
+# same database: one loads while the other reads, and the numbers that
+# come out are not of anything. That happened on server2 and server3 and
+# it announced itself as a data integrity failure, which is the only
+# reason it was noticed. flock is not on every host, so a host without
+# it says so and carries on rather than refusing to run.
+mkdir -p "$WORK"
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$WORK/.bench.lock"
+  if ! flock -n 9; then
+    echo "# another benchmark holds $WORK/.bench.lock, waiting for it" >&2
+    flock 9
+  fi
+else
+  echo "# no flock on this host, so nothing is stopping two runs sharing $WORK" >&2
+fi
 mkdir -p "$WORK"
 
 BIN="${BIN:-$WORK/ycsb-$ENGINE}"
