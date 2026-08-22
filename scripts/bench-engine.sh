@@ -126,6 +126,17 @@ reset_data() {
                    "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
     pg|neo4j) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
+  # The reset knows one path per engine and the engines keep more than
+  # one, which is how ladybug ran a whole sweep beside an orphaned write
+  # ahead log (tamnd/zu#605), how zu1 did the same silently, and how zu2
+  # left a checkpoint for the next database at that path to adopt
+  # (tamnd/zu#610). All three would have said so here the first time they
+  # ran. A leftover is not fatal on its own so the run carries on, and
+  # the line is in the TSV where a reader of the numbers will meet it.
+  local left
+  left="$(ls -d "$DATA".* 2>/dev/null | tr '\n' ' ')"
+  [ -n "$left" ] && echo "# WRONG, the reset left $left behind" | tee -a "$OUT"
+  return 0
 }
 
 # The file backed engines start each workload from an empty path, so the
