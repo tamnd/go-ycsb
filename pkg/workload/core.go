@@ -264,9 +264,12 @@ func (c *core) buildDeterministicValue(state *coreState, key string, fieldKey st
 }
 
 func (c *core) verifyRow(state *coreState, key string, values map[string][]byte) {
+	// An empty row is the failure this check exists to catch, not a
+	// case to skip. An engine that stored the key and dropped the
+	// values answers every read without an error and passes a row count
+	// (tamnd/zu#551), and this used to wave it through as well.
 	if len(values) == 0 {
-		// null data here, need panic?
-		return
+		util.Fatalf("%s came back with no fields at all", key)
 	}
 
 	for fieldKey, value := range values {
@@ -683,7 +686,14 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 		insertProportion := p.GetFloat64(prop.InsertProportion, prop.InsertProportionDefault)
 		opCount := p.GetInt64(prop.OperationCount, 0)
 		expectedNewKeys := int64(float64(opCount) * insertProportion * 2.0)
-		keyrangeUpperBound = insertStart + insertCount + expectedNewKeys
+		// The last loaded key is insertStart+insertCount-1, the same
+		// bound the uniform and sequential branches use. Without the
+		// minus one this range includes a key that was never loaded and
+		// never will be, and a read of it comes back empty. With
+		// dataintegrity on that is a failed run; with it off, which is
+		// how a sweep runs, it is a read that returns nothing and
+		// reports as the fastest read in the sample.
+		keyrangeUpperBound = insertStart + insertCount - 1 + expectedNewKeys
 		c.keyChooser = generator.NewScrambledZipfian(keyrangeLowerBound, keyrangeUpperBound, generator.ZipfianConstant)
 	case "latest":
 		c.keyChooser = generator.NewSkewedLatest(c.transactionInsertKeySequence)

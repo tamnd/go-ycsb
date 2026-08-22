@@ -273,6 +273,38 @@ rows() {  # rows <workload> <phase>
 # where it is not.
 SKIP=""
 
+# One small self check before the sweep, because throughput is worth
+# nothing if the rows are not there. YCSB's own data integrity mode
+# writes a value derived from the key and the field name and compares it
+# on the way back, so a wrong value, a missing field or an empty row
+# stops the run instead of being reported as a fast one. duckdb spent
+# several sweeps storing keys with no values at all (tamnd/zu#551) and
+# nothing here noticed, and this is what would have.
+#
+# Ten thousand records rather than the sweep's count, since this is a
+# correctness check and not a measurement, and it costs a few seconds.
+verify() {
+  local records=10000 raw
+  reset_data
+  raw=$("$BIN" load "$ENGINE" -P workloads/workloadc "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}"     -p dataintegrity=true -p recordcount="$records" -p threadcount=1 2>&1) || true
+  if ! grep -qE '^(INSERT|TOTAL) ' <<<"$raw"; then
+    echo "# verify: WRONG, $ENGINE could not load the data integrity set" | tee -a "$OUT"
+    return 0
+  fi
+  raw=$("$BIN" run "$ENGINE" -P workloads/workloadc "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}"     -p dataintegrity=true -p recordcount="$records" -p operationcount="$records" -p threadcount=1 2>&1) || true
+  if grep -qE '^(READ|TOTAL) ' <<<"$raw"; then
+    echo "# verify: $ENGINE gave back every field of every row it was asked for" | tee -a "$OUT"
+  else
+    echo "# verify: WRONG, $ENGINE failed the data integrity read" | tee -a "$OUT"
+    grep -iE 'unexpected|no fields|error' <<<"$raw" | head -3 | while IFS= read -r line; do
+      echo "# verify: $line" | tee -a "$OUT"
+    done
+  fi
+  return 0
+}
+
+verify
+
 for w in a b c d e f; do
   if [[ " $SKIP " == *" $w "* ]]; then
     echo "# workload $w skipped: $ENGINE does not support scan" | tee -a "$OUT"
