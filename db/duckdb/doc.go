@@ -8,9 +8,11 @@ package duckdb
 // which is where this adapter first pointed, and that repository is now
 // archived: the project moved into the duckdb organisation and the
 // releases moved with it. The version numbering says which DuckDB is
-// inside, so v2.10505.0 is DuckDB 1.5.5, and the archived path stopped
-// at a DuckDB two minor versions older. Benchmarking the old one and
-// calling it DuckDB would have been benchmarking an abandoned fork.
+// inside, so v2.10505.0 is DuckDB 1.5.5. The archived path's last
+// release pins bindings v0.1.21, which is DuckDB 1.4.1, so every duckdb
+// row taken before this is a whole minor version behind and none of
+// them said so. Benchmarking that and calling it DuckDB would have been
+// benchmarking an abandoned fork.
 //
 // Building takes a while the first time because the bundled library is a
 // large static archive and cgo has to link it.
