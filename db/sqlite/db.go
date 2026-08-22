@@ -46,7 +46,36 @@ const (
 	sqliteBusyTimeout         = "sqlite.busy_timeout"
 	sqliteOptimistic          = "sqlite.optimistic"
 	sqliteOptimisticBackoffMs = "sqlite.optimistic_backoff_ms"
+	sqliteCacheSize           = "sqlite.cache_size"
+	sqliteMmapSize            = "sqlite.mmap_size"
+	sqliteStmtCacheSize       = "sqlite.stmt_cache_size"
+	sqliteReadTx              = "sqlite.readtx"
+	sqliteTempStore           = "sqlite.temp_store"
 )
+
+// The driver name the adapter opens under. It is not "sqlite3", because
+// two of the settings sqlite needs to run at its best are per connection
+// pragmas with no DSN spelling in the driver, and a connect hook is the
+// only place a pool can apply them.
+const sqliteDriverName = "sqlite3_ycsb"
+
+// The pragmas the connect hook runs, set once by Create before the pool
+// opens its first connection. One process opens one database here, which
+// is why a package level value is enough.
+var sqliteConnPragmas []string
+
+func init() {
+	sql.Register(sqliteDriverName, &sqlite3.SQLiteDriver{
+		ConnectHook: func(c *sqlite3.SQLiteConn) error {
+			for _, p := range sqliteConnPragmas {
+				if _, err := c.Exec(p, nil); err != nil {
+					return fmt.Errorf("%s: %w", p, err)
+				}
+			}
+			return nil
+		},
+	})
+}
 
 type sqliteCreator struct {
 }
@@ -56,6 +85,7 @@ type sqliteDB struct {
 	db         *sql.DB
 	verbose    bool
 	optimistic bool
+	readTx     bool
 	backoffMs  int
 
 	bufPool *util.BufPool
@@ -107,15 +137,43 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	maxOpenConns := p.GetInt(sqliteMaxOpenConns, threads)
 	maxIdleConns := p.GetInt(sqliteMaxIdleConns, threads)
 
+	// Three more settings that sqlite is much slower without, and that
+	// the adapter did not set at all until the latency work went looking
+	// for why a read through here cost eight times what the same read
+	// costs in a C loop over the same database.
+	//
+	// The page cache is 2 MiB by default, which for any database worth
+	// benchmarking means a pread for every read. It is per connection,
+	// so 64 MiB at n threads is 64n and the number below is deliberately
+	// not a gigabyte: a run that swaps is a benchmark of the swap.
+	//
+	// The mapping is the cheaper half of the same thing. mmap pages are
+	// file backed and shared between connections, so a large mmap costs
+	// address space rather than memory, and it takes the copy out of the
+	// read path for anything the page cache misses.
+	//
+	// The statement cache is the driver's, off by default, which means
+	// every point read prepares and finalises a statement around one
+	// step. Thirty two is more shapes than this workload has.
+	cacheSize := p.GetString(sqliteCacheSize, "-65536")
+	mmapSize := p.GetString(sqliteMmapSize, "8589934592")
+	tempStore := p.GetString(sqliteTempStore, "MEMORY")
+	sqliteConnPragmas = []string{
+		fmt.Sprintf("PRAGMA mmap_size = %s;", mmapSize),
+		fmt.Sprintf("PRAGMA temp_store = %s;", tempStore),
+	}
+
 	v := url.Values{}
 	v.Set("cache", cache)
 	v.Set("mode", mode)
 	v.Set("_journal_mode", journalMode)
 	v.Set("_synchronous", synchronous)
 	v.Set("_busy_timeout", p.GetString(sqliteBusyTimeout, "5000"))
+	v.Set("_cache_size", cacheSize)
+	v.Set("_stmt_cache_size", p.GetString(sqliteStmtCacheSize, "32"))
 	dsn := fmt.Sprintf("file:%s?%s", dbPath, v.Encode())
 	var err error
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open(sqliteDriverName, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +182,7 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	db.SetMaxIdleConns(maxIdleConns)
 
 	d.optimistic = p.GetBool(sqliteOptimistic, false)
+	d.readTx = p.GetBool(sqliteReadTx, false)
 	d.backoffMs = p.GetInt(sqliteOptimisticBackoffMs, 5)
 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
 	d.db = db
@@ -144,6 +203,13 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	if err := d.db.QueryRow("select sqlite_version()").Scan(&version); err == nil {
 		fmt.Printf("sqlite version: %s\n", version)
 	}
+	// The settings that turned out to be worth a factor of two on a
+	// point read, printed for the same reason the version is: a row in a
+	// TSV that does not say how the engine was configured cannot be
+	// compared with anything.
+	fmt.Printf("sqlite config: journal=%s synchronous=%s cache=%s cache_size=%s mmap_size=%s stmt_cache_size=%s readtx=%v conns=%d\n",
+		journalMode, synchronous, cache, cacheSize, mmapSize,
+		p.GetString(sqliteStmtCacheSize, "32"), d.readTx, maxOpenConns)
 
 	return d, nil
 }
@@ -212,7 +278,16 @@ func (db *sqliteDB) optimisticTx(ctx context.Context, f func(tx *sql.Tx) error) 
 	}
 }
 
-func (db *sqliteDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
+// What doQueryRows needs of the thing it runs on, which is the same for
+// a transaction and for the pool itself. A read that is one statement is
+// already atomic in sqlite, so it does not have to be given a BEGIN and
+// a COMMIT of its own, and those are two more statements across the cgo
+// boundary for a call that steps a cursor once.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func (db *sqliteDB) doQueryRows(ctx context.Context, tx querier, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
 	if db.verbose {
 		fmt.Printf("%s %v\n", query, args)
 	}
@@ -250,7 +325,7 @@ func (db *sqliteDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, c
 	return vs, rows.Err()
 }
 
-func (db *sqliteDB) doRead(ctx context.Context, tx *sql.Tx, table string, key string, fields []string) (map[string][]byte, error) {
+func (db *sqliteDB) doRead(ctx context.Context, tx querier, table string, key string, fields []string) (map[string][]byte, error) {
 	var query string
 	if len(fields) == 0 {
 		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY = ?`, table)
@@ -270,6 +345,9 @@ func (db *sqliteDB) doRead(ctx context.Context, tx *sql.Tx, table string, key st
 }
 
 func (db *sqliteDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	if !db.readTx {
+		return db.doRead(ctx, db.db, table, key, fields)
+	}
 	var output map[string][]byte
 	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doRead(ctx, tx, table, key, fields)
@@ -279,7 +357,7 @@ func (db *sqliteDB) Read(ctx context.Context, table string, key string, fields [
 	return output, err
 }
 
-func (db *sqliteDB) doScan(ctx context.Context, tx *sql.Tx, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+func (db *sqliteDB) doScan(ctx context.Context, tx querier, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
 	var query string
 	if len(fields) == 0 {
 		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, table)
@@ -293,6 +371,9 @@ func (db *sqliteDB) doScan(ctx context.Context, tx *sql.Tx, table string, startK
 }
 
 func (db *sqliteDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	if !db.readTx {
+		return db.doScan(ctx, db.db, table, startKey, count, fields)
+	}
 	var output []map[string][]byte
 	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doScan(ctx, tx, table, startKey, count, fields)
