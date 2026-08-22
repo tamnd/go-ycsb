@@ -326,10 +326,27 @@ func (db *duckdbDB) doInsert(ctx context.Context, tx *sql.Tx, table string, key 
 	args := make([]interface{}, 0, 1+len(values))
 	args = append(args, key)
 
-	// OR IGNORE matches what the sqlite adapter does, so a duplicate key
-	// from the workload generator is a no-op in both rather than an error
-	// in one of them.
-	buf.WriteString("INSERT OR IGNORE INTO ")
+	// A plain INSERT, and not the OR IGNORE the sqlite adapter uses, and
+	// this is a workaround rather than a preference.
+	//
+	// DuckDB 1.4.1 binds only the first parameter of a prepared INSERT
+	// that carries a conflict clause. Every other parameter comes out
+	// NULL, and nothing is reported: the statement prepares, the row
+	// lands, and the row is a key with ten NULL columns beside it. It is
+	// the clause and not the wording, so OR IGNORE, OR REPLACE and
+	// ON CONFLICT DO NOTHING all do it, with ? or with $1. That is a
+	// silent wrong answer and it invalidated every duckdb number this
+	// harness has produced: a load of 100000 records of a kilobyte each
+	// settled at 8.5 MiB on device, which is 89 bytes a record and is
+	// the key and its index and nothing else, and every read afterwards
+	// was a fast read of a row with no data in it.
+	//
+	// YCSB generates each key once in a load, so a conflict clause was
+	// insurance rather than a requirement. The insurance is taken here
+	// instead, by treating a constraint violation as the no-op OR IGNORE
+	// would have made it, which keeps the semantics the sqlite adapter
+	// has without the clause that breaks the binding.
+	buf.WriteString("INSERT INTO ")
 	buf.WriteString(table)
 	buf.WriteString(" (YCSB_KEY")
 
@@ -346,10 +363,25 @@ func (db *duckdbDB) doInsert(ctx context.Context, tx *sql.Tx, table string, key 
 	buf.WriteByte(')')
 
 	_, err := tx.ExecContext(ctx, buf.String(), args...)
+	if err != nil && isDuplicate(err) {
+		return nil
+	}
 	if err != nil && db.verbose {
 		fmt.Printf("error(doInsert): %s: %+v\n", buf.String(), err)
 	}
 	return err
+}
+
+// isDuplicate says whether an error is the primary key already being
+// there, which is the one error a load may meet and carry on from.
+//
+// By the text, because the driver hands back an error whose type says
+// nothing about which constraint was broken. There is one constraint on
+// the table and it is the primary key, so the match is as specific as it
+// needs to be.
+func isDuplicate(err error) bool {
+	return strings.Contains(err.Error(), "Constraint Error") &&
+		strings.Contains(err.Error(), "Duplicate key")
 }
 
 func (db *duckdbDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
