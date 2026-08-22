@@ -388,6 +388,13 @@ verify
 # sqlite. A narrowed run writes the same TSV, so it overwrites the one a
 # full sweep left, and it is on the caller to point OUT somewhere else.
 for w in ${WORKLOADS:-a b c d e f}; do
+  # The load average again, once a workload. The header records what the
+  # host was carrying when the sweep started and a sweep takes hours, so
+  # on a machine that is doing its own work at the same time the header
+  # is out of date by workload b. A row is only comparable with the rows
+  # taken under the same load, and this is where a reader finds out.
+  echo "# $w loadavg: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)" | tee -a "$OUT"
+
   if [[ " $SKIP " == *" $w "* ]]; then
     echo "# workload $w skipped: $ENGINE does not support scan" | tee -a "$OUT"
     continue
