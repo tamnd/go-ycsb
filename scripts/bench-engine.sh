@@ -162,9 +162,14 @@ storage() {  # storage <workload> <phase> <output>
   # beside the disk number for the same reason the disk number is
   # printed beside the throughput: a result that reports one resource is
   # picking whichever one reads better.
+  #
+  # `scan rows` is the harness's own line rather than an adapter's, and
+  # it is here because a scan that returns nothing is the fastest scan in
+  # any sweep and raises no error (tamnd/zu#560). A mean well under the
+  # asked for length is a row to throw away.
   while IFS= read -r note; do
     [ -n "$note" ] && echo "# $1 $2: $note" | tee -a "$OUT"
-  done < <(grep -E '^[a-z0-9]+ (storage|index|scan plane|promotion|recovery): ' <<<"$3")
+  done < <(grep -E '^([a-z0-9]+ (storage|index|scan plane|promotion|recovery)|scan rows): ' <<<"$3")
   return 0
 }
 
