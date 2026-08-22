@@ -159,6 +159,22 @@ esac
 
 field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
 
+# Probed here, at the top level, rather than lazily on first use. Every
+# phase runs `timed` inside a command substitution, so a variable set in
+# there is set in a subshell and gone by the next phase, and the version
+# that cached the answer lazily re-probed and reprinted the notice once
+# per phase, twelve times in a sweep.
+#
+# The shell keyword cannot report rss, so this wants the binary. BSD time
+# takes -l and reports bytes where GNU takes -v and reports kbytes; the
+# benchmark hosts are Linux and WSL, so -v is what is supported and
+# anything else drops the memory column rather than printing a number in
+# the wrong unit.
+TIME_BIN=""
+if /usr/bin/time -v true >/dev/null 2>&1; then
+  TIME_BIN=/usr/bin/time
+fi
+
 {
   echo "# engine: $ENGINE"
   echo "# host: $(hostname)"
@@ -167,6 +183,7 @@ field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
   echo "# cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu)"
   echo "# loadavg at start: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
   echo "# records: $RECORDS threads: $THREADS batch: $BATCH"
+  [ -z "$TIME_BIN" ] && echo "# no /usr/bin/time -v here, so there is no memory column in this file"
   echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } | tee "$OUT"
 
@@ -264,6 +281,52 @@ space() {  # space <workload> <phase>
   fi
   awk -v w="$1" -v p="$2" -v e="$ENGINE" -v kb="$kb" -v n="$RECORDS" \
     'BEGIN { printf "# %s %s: %s on device %.1f MiB, %.0f bytes a record\n", w, p, e, kb / 1024, kb * 1024 / n }' \
+    | tee -a "$OUT"
+  return 0
+}
+
+# Peak resident memory, asked of the kernel rather than of the engine.
+#
+# The storage lines an adapter prints are the engine's own account of
+# itself, and only zu2 prints them, so they can rank zu2 against zu2 and
+# nothing else. This is the same question put to every engine in the same
+# words, and it is the third resource: the sweep has had a disk column
+# since Y3 and a result that reports one resource is picking whichever
+# one reads better.
+#
+# It costs nothing to collect. Every phase already captures the process's
+# combined output, and GNU time writes its report to stderr, tab
+# indented, where none of the row patterns in this file can match it.
+#
+# pg and neo4j are the exception and get a sentence instead of a number.
+# Their data lives in a server process this script never started, so what
+# time sees is the client, and a client's footprint printed in a memory
+# column beside four embedded engines is worse than a blank.
+timed() {  # timed <argv...>
+  case "$ENGINE" in
+    pg|neo4j) "$@" ;;
+    *) if [ -n "$TIME_BIN" ]; then "$TIME_BIN" -v "$@"; else "$@"; fi ;;
+  esac
+}
+
+maxrss() {  # maxrss <workload> <phase> <output>
+  case "$ENGINE" in
+    pg|neo4j)
+      echo "# $1 $2: $ENGINE keeps its data in a server process, no memory figure from this side" \
+        | tee -a "$OUT"
+      return 0
+      ;;
+  esac
+  local kb
+  kb="$(sed -n 's/.*Maximum resident set size (kbytes): \([0-9]*\)/\1/p' <<<"${3:-}" | tail -1)"
+  [ -z "$kb" ] && return 0
+  # A high water mark for the whole process, so the harness's own
+  # allocation is in it. That floor is the same for every engine at a
+  # given workload and record count, which makes the column fair for
+  # ranking engines against each other and wrong for any absolute claim
+  # about what one of them costs on its own.
+  awk -v w="$1" -v p="$2" -v e="$ENGINE" -v kb="$kb" -v n="$RECORDS" \
+    'BEGIN { printf "# %s %s: %s peak rss %.1f MiB, %.0f bytes a record\n", w, p, e, kb / 1024, kb * 1024 / n }' \
     | tee -a "$OUT"
   return 0
 }
@@ -408,7 +471,7 @@ for w in ${WORKLOADS:-a b c d e f}; do
 
   reset_data
 
-  raw=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" \
+  raw=$(timed "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1)
   load_out=$(grep -E '^(INSERT|TOTAL) ' <<<"$raw")
   if [ -z "$load_out" ]; then
@@ -421,9 +484,10 @@ for w in ${WORKLOADS:-a b c d e f}; do
   version "$raw"
   storage "$w" load "$raw"
   space "$w" load
+  maxrss "$w" load "$raw"
   rows "$w" load "$raw"
 
-  raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" \
+  raw=$(timed "$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
     -p threadcount="$THREADS" 2>&1)
   run_out=$(grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ' <<<"$raw")
@@ -440,6 +504,7 @@ for w in ${WORKLOADS:-a b c d e f}; do
   emit "$w" run "$run_out"
   storage "$w" run "$raw"
   space "$w" run
+  maxrss "$w" run "$raw"
 done
 
 reset_data
