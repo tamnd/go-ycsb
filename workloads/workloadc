@@ -21,6 +21,11 @@
 #   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
 #   Request distribution: zipfian
 
+# tamnd note: back on the YCSB value. pingcap/go-ycsb 6f16ad8 in 2019
+# turned requestdistribution from zipfian to uniform across a, b, c, e
+# and f, which takes out the locality the YCSB paper put in on purpose
+# and makes every engine's cache look worse than it is.
+
 recordcount=1000
 operationcount=1000
 workload=core
@@ -32,7 +37,7 @@ updateproportion=0
 scanproportion=0
 insertproportion=0
 
-requestdistribution=uniform
+requestdistribution=zipfian
 
 
 

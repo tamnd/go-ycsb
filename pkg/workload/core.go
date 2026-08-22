@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/magiconair/properties"
@@ -78,6 +79,18 @@ type core struct {
 	insertionRetryInterval       int64
 
 	valuePool sync.Pool
+
+	// What the scans actually handed back, which nothing used to look
+	// at. `doTransactionScan` throws the rows away, so an engine that
+	// returns nothing at all reports the fastest SCAN in the sweep and
+	// no error anywhere. That is how the duckdb rows in every sweep so
+	// far came to be wrong (tamnd/zu#551), and the same hole is open on
+	// this side of the call for every engine. These two are what close
+	// it: the run prints rows against scans at the end, and a mean well
+	// under the mean scan length is a result to throw away.
+	scans     atomic.Int64
+	scanRows  atomic.Int64
+	scanAsked atomic.Int64
 }
 
 func getFieldLengthGenerator(p *properties.Properties) ycsb.Generator {
@@ -157,6 +170,12 @@ func (c *core) CleanupThread(_ context.Context) {
 
 // Close implements the Workload Close interface.
 func (c *core) Close() error {
+	if scans := c.scans.Load(); scans > 0 {
+		rows := c.scanRows.Load()
+		asked := c.scanAsked.Load()
+		fmt.Printf("scan rows: %d rows over %d scans, %.1f a scan, %.1f asked for\n",
+			rows, scans, float64(rows)/float64(scans), float64(asked)/float64(scans))
+	}
 	return nil
 }
 
@@ -506,7 +525,10 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 		fields = state.fieldNames
 	}
 
-	_, err := db.Scan(ctx, c.table, startKeyName, int(scanLen), fields)
+	rows, err := db.Scan(ctx, c.table, startKeyName, int(scanLen), fields)
+	c.scans.Add(1)
+	c.scanAsked.Add(int64(scanLen))
+	c.scanRows.Add(int64(len(rows)))
 
 	return err
 }
