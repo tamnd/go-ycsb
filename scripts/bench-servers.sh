@@ -53,7 +53,25 @@ up() {
 
 # restart unless-stopped only helps once the docker daemon is back. On
 # WSL the daemon goes away with the VM, so ask for a start either way.
+#
+# A container that is crash looping is started here and stays down, and
+# the only sign of it is the wait timing out two minutes later with
+# Restarting in the status line. Both engines get there on their own:
+# PostgreSQL leaves a zero length postmaster.pid behind when the VM goes
+# away under it and then refuses to start on the remnant, and Neo4j on
+# latest reads a data directory an older tag wrote and fails validating
+# a setting the newer one does not take from that path. Neither is worth
+# recovering by hand for a benchmark that owns its data, so a container
+# that is restarting is rebuilt from nothing instead of waited on.
 start_existing() {
+  local name
+  for name in neo4j-ycsb pg-ycsb; do
+    case "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" in
+      # Nothing there at all, which is a first run on this host.
+      "")           echo "building both, $name is not there"; up; return ;;
+      restarting)   echo "rebuilding both, $name is crash looping"; up; return ;;
+    esac
+  done
   docker start neo4j-ycsb pg-ycsb >/dev/null 2>&1
 }
 
