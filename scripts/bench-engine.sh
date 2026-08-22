@@ -115,7 +115,7 @@ reset_data() {
     sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
     ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
-    zu)      rm -rf "$DATA.zu1" ;;
+    zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # A zu2 database is a log and three sidecars beside it, and removing
     # the log alone leaves the previous workload's checkpoint and cold
     # file where the next one's log lands. tamnd/zu#610. The engine takes
