@@ -44,6 +44,32 @@ for e in "${ENGINES[@]}"; do
   # one, the caller just has to name what the archive uses. The cgo lines
   # in db.go cover the Homebrew case on macOS, so this only fires on Linux
   # and only if the caller has not already set CGO_LDFLAGS.
+  # Extra compile flags, same idea.
+  #
+  # SQLITE_DEFAULT_MEMSTATUS=0 for sqlite. mattn/go-sqlite3 compiles the
+  # amalgamation without it, so sqlite's allocator takes one process wide
+  # mutex per malloc to maintain a byte counter for sqlite3_memory_used,
+  # which nothing in this harness reads. A point read does several
+  # allocations, so at n threads every read serialises n ways on that
+  # lock and sqlite gets slower with more threads instead of faster.
+  # Measured natively outside the harness on an M4 at eight threads it is
+  # the difference between 83000 reads a second and 635000, which is
+  # 7.6x. Through this harness the same comparison is 127000 against
+  # 140000, which is ten percent, and the gap between those two figures
+  # is itself the point: the client and the cgo crossing cost tens of
+  # microseconds an operation here, so a lock inside sqlite that costs
+  # microseconds is most of the engine and a tenth of what the harness
+  # times. Ten percent is still ten percent and it is a compile flag.
+  # See tamnd/zu#646.
+  # The default when CGO_CFLAGS is unset is "-O2 -g", and setting the
+  # variable replaces that rather than adding to it, so the default has
+  # to be written out or the sqlite amalgamation compiles at -O0 and the
+  # fix below costs more than it saves.
+  cflags="${CGO_CFLAGS:--O2 -g}"
+  if [ "$e" = sqlite ]; then
+    cflags="$cflags -DSQLITE_DEFAULT_MEMSTATUS=0"
+  fi
+
   ldflags="${CGO_LDFLAGS:-}"
   if [ "$e" = ladybug ] && [ -z "$ldflags" ] && [ "$(uname -s)" = Linux ]; then
     ldflags="-L${LBUG_LIB:-/usr/local/lib} -llbug -lssl -lcrypto -latomic -lstdc++ -lm -ldl -Wl,-rpath,${LBUG_LIB:-/usr/local/lib}"
@@ -51,9 +77,9 @@ for e in "${ENGINES[@]}"; do
 
   echo "building $WORK/ycsb-$e${tag:+ (tag $tag)}"
   if [ -n "$tag" ]; then
-    CGO_LDFLAGS="$ldflags" go build -tags "$tag" -o "$WORK/ycsb-$e" ./cmd/go-ycsb
+    CGO_CFLAGS="$cflags" CGO_LDFLAGS="$ldflags" go build -tags "$tag" -o "$WORK/ycsb-$e" ./cmd/go-ycsb
   else
-    go build -o "$WORK/ycsb-$e" ./cmd/go-ycsb
+    CGO_CFLAGS="$cflags" go build -o "$WORK/ycsb-$e" ./cmd/go-ycsb
   fi
 done
 
