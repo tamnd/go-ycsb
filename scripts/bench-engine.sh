@@ -114,7 +114,7 @@ reset_data() {
   case "$ENGINE" in
     sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
     duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
-    ladybug) rm -rf "$DATA.lbug" ;;
+    ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
     zu)      rm -rf "$DATA.zu1" ;;
     zu2)     rm -rf "$DATA.zu2" ;;
     pg|neo4j) : ;;  # nothing on this side, see LOAD_ARGS below
