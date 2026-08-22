@@ -756,6 +756,17 @@ func (db *zu2DB) printStorage() {
 	fmt.Printf("zu2 index: %d of %d slots in use, load %.2f, %d carrying more than one key, growths %d, resizing %t\n",
 		occupancy, slots, load, foreign, grows, resizing != 0)
 
+	// The count the sweep checks a load against, which the index line
+	// above cannot give it. Slots are not keys: a displaced key lives on
+	// somebody else's chain, so a load of 100000 prints 99793 slots with
+	// nothing missing (tamnd/zu#486), and a harness comparing that to the
+	// record count would report data loss on a healthy database. This is
+	// keys, and it is the only engine side answer to the question
+	// tamnd/zu#560 asks of every other engine here: the loader said it
+	// wrote them, did they arrive. Deletes do not take it back down, so
+	// it belongs to the load phase rather than to a run with deletes.
+	fmt.Printf("zu2 rows: %d keys\n", uint64(C.zu2_index_keys(db.db)))
+
 	// Only when there is a plane, and it is memory rather than disk: the
 	// plane is rebuilt from the log at open and never written to it, so
 	// it costs the process and not the device. Keys here is every key

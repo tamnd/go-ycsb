@@ -259,7 +259,7 @@ space() {  # space <workload> <phase>
 # the line is left out rather than guessed at, and where it answers a
 # number other than the record count the line says so loudly, because
 # every other row in the file is meaningless if this one is wrong.
-rows() {  # rows <workload> <phase>
+rows() {  # rows <workload> <phase> [output]
   local n="" have=""
   case "$ENGINE" in
     sqlite)
@@ -283,9 +283,18 @@ rows() {  # rows <workload> <phase>
               -u "${NEO4J_USER:-neo4j}" -p "${NEO4J_PASSWORD:-benchpass}" \
               --format plain 'match (r:usertable) return count(r)' 2>/dev/null | tail -1)
       ;;
-    zu|zu2)
-      # These print their own index occupancy on the storage line, which
-      # is the same question asked of the plane that answers reads.
+    zu2)
+      # No client on the host to ask, so the engine answers in its own
+      # output and this reads it back out. The line is keys and not the
+      # slot count on the index line, which is legitimately lower than
+      # the number of keys because a displaced key lives on somebody
+      # else's chain (tamnd/zu#486), and comparing that to a record
+      # count reports data loss on a healthy database.
+      have=yes
+      n=$(sed -n 's/^zu2 rows: \([0-9]*\) keys$/\1/p' <<<"${3:-}" | tail -1)
+      ;;
+    zu)
+      # zu1 has no such line, and it is not the engine under test.
       return 0
       ;;
   esac
@@ -348,7 +357,12 @@ verify() {
 
 verify
 
-for w in a b c d e f; do
+# All six by default, which is what a sweep runs. WORKLOADS narrows it,
+# for the case where one workload is being re-run on its own after a fix
+# rather than the whole set again: WORKLOADS="b" scripts/bench-engine.sh
+# sqlite. A narrowed run writes the same TSV, so it overwrites the one a
+# full sweep left, and it is on the caller to point OUT somewhere else.
+for w in ${WORKLOADS:-a b c d e f}; do
   if [[ " $SKIP " == *" $w "* ]]; then
     echo "# workload $w skipped: $ENGINE does not support scan" | tee -a "$OUT"
     continue
@@ -374,7 +388,7 @@ for w in a b c d e f; do
   emit "$w" load "$load_out"
   storage "$w" load "$raw"
   space "$w" load
-  rows "$w" load
+  rows "$w" load "$raw"
 
   raw=$("$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
