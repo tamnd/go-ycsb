@@ -88,6 +88,10 @@ func InitMeasure(p *properties.Properties) {
 	default:
 		panic("unsupported measurement type: " + measurementType)
 	}
+	// What the host's clock can resolve, once, before anything is timed
+	// with it. A run whose percentile columns are the timer tick rather
+	// than the engine has to say so, or the zeros read as a result.
+	reportClock(os.Stdout)
 	EnableWarmUp(p.GetInt64(prop.WarmUpTime, 0) > 0)
 }
 
