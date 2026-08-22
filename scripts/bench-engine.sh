@@ -158,7 +158,18 @@ storage() {  # storage <workload> <phase> <output>
 space() {  # space <workload> <phase>
   local kb
   kb="$(du -sk "$DATA".* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')"
-  [ "${kb:-0}" -gt 0 ] || return 0
+  # A phase that reported throughput and left nothing on the device is not
+  # a missing measurement, it is a result, and staying quiet about it reads
+  # in the file as if the engine had no local path at all. duckdb did this
+  # on gamingpc for workload b and the log said nothing.
+  if [ "${kb:-0}" -le 0 ]; then
+    case "$ENGINE" in
+      sqlite|duckdb|ladybug|zu|zu2)
+        echo "# $1 $2: WRONG, $ENGINE left nothing at $DATA.*" | tee -a "$OUT"
+        ;;
+    esac
+    return 0
+  fi
   awk -v w="$1" -v p="$2" -v e="$ENGINE" -v kb="$kb" -v n="$RECORDS" \
     'BEGIN { printf "# %s %s: %s on device %.1f MiB, %.0f bytes a record\n", w, p, e, kb / 1024, kb * 1024 / n }' \
     | tee -a "$OUT"
@@ -182,25 +193,25 @@ space() {  # space <workload> <phase>
 # number other than the record count the line says so loudly, because
 # every other row in the file is meaningless if this one is wrong.
 rows() {  # rows <workload> <phase>
-  local n=""
+  local n="" have=""
   case "$ENGINE" in
     sqlite)
-      command -v sqlite3 >/dev/null 2>&1 &&
+      command -v sqlite3 >/dev/null 2>&1 && have=yes &&
         n=$(sqlite3 "$DATA.db" 'select count(*) from usertable' 2>/dev/null)
       ;;
     duckdb)
-      command -v duckdb >/dev/null 2>&1 &&
+      command -v duckdb >/dev/null 2>&1 && have=yes &&
         n=$(duckdb "$DATA.db" -noheader -list 'select count(*) from usertable' 2>/dev/null)
       ;;
     pg)
-      command -v psql >/dev/null 2>&1 &&
+      command -v psql >/dev/null 2>&1 && have=yes &&
         n=$(PGPASSWORD="${PGPASSWORD:-benchpass}" psql -qtAX \
               -h "${PGHOST:-127.0.0.1}" -p "${PGPORT:-55432}" \
               -U "${PGUSER:-postgres}" -d "${PGDATABASE:-ycsb}" \
               -c 'select count(*) from usertable' 2>/dev/null)
       ;;
     neo4j)
-      command -v cypher-shell >/dev/null 2>&1 &&
+      command -v cypher-shell >/dev/null 2>&1 && have=yes &&
         n=$(cypher-shell -a "${NEO4J_URI:-bolt://127.0.0.1:7687}" \
               -u "${NEO4J_USER:-neo4j}" -p "${NEO4J_PASSWORD:-benchpass}" \
               --format plain 'match (r:usertable) return count(r)' 2>/dev/null | tail -1)
@@ -212,7 +223,16 @@ rows() {  # rows <workload> <phase>
       ;;
   esac
   n="${n//[[:space:]]/}"
-  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  # A client that is present and answered nothing is a third case, and it
+  # used to be silent, which made it look like the host had no client. It
+  # is the case that matters most, because the count is there to catch a
+  # load that reported success and wrote nothing.
+  case "$n" in
+    '' | *[!0-9]*)
+      [ -n "$have" ] && echo "# $1 $2: the $ENGINE client would not answer the row count" | tee -a "$OUT"
+      return 0
+      ;;
+  esac
   if [ "$n" -eq "$RECORDS" ]; then
     echo "# $1 $2: $ENGINE holds $n rows, which is the record count" | tee -a "$OUT"
   else
