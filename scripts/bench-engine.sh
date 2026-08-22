@@ -181,13 +181,20 @@ storage() {  # storage <workload> <phase> <output>
   # printed beside the throughput: a result that reports one resource is
   # picking whichever one reads better.
   #
+  # The tier line is the same argument about the row above it. How much
+  # of a zu2 database has settled into the cold tier depends on how much
+  # of the background schedule the run overlapped, it came out anywhere
+  # from 2 to 35 percent across otherwise identical runs, and a latency
+  # compared across two runs that settled differently is a comparison of
+  # two storage layouts (tamnd/zu#600).
+  #
   # `scan rows` is the harness's own line rather than an adapter's, and
   # it is here because a scan that returns nothing is the fastest scan in
   # any sweep and raises no error (tamnd/zu#560). A mean well under the
   # asked for length is a row to throw away.
   while IFS= read -r note; do
     [ -n "$note" ] && echo "# $1 $2: $note" | tee -a "$OUT"
-  done < <(grep -E '^([a-z0-9]+ (storage|index|scan plane|promotion|recovery)|scan rows): ' <<<"$3")
+  done < <(grep -E '^([a-z0-9]+ (storage|index|tier|scan plane|promotion|recovery)|scan rows): ' <<<"$3")
   return 0
 }
 

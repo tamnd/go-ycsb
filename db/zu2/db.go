@@ -720,6 +720,34 @@ func (db *zu2DB) printStorage() {
 		float64(disk)/mib, float64(span)/mib, float64(written)/mib,
 		float64(resident*pageBytes)/mib, resident)
 
+	// The tier's share of that disk number, which is the context every
+	// row measured with the tier on needs (tamnd/zu#600). How much of a
+	// database has settled down there depends on how much of the
+	// background compaction schedule the run happened to overlap, and it
+	// came out anywhere from 2 to 35 percent across otherwise identical
+	// runs. Two rows that settled differently were measured against two
+	// different storage layouts and their latencies do not compare, so
+	// this says which layout the row above it was taken on rather than
+	// leaving it to be assumed.
+	//
+	// Migrated is the bytes a pass moved down there since the open and
+	// span is what is down there now, and they are printed together
+	// because a cold pass can take back everything it was given: a run
+	// that migrated a great deal and ends with a small span did the work
+	// and does not look like it.
+	var cold C.uint64_t
+	if st := C.zu2_cold_disk_bytes(db.db, &cold); st != C.ZU2_OK {
+		fmt.Printf("zu2 tier: unavailable, %v\n", dbErr(db.db, st, "cold disk bytes failed"))
+	} else if migrated := uint64(C.zu2_migrated(db.db)); migrated > 0 || cold > 0 {
+		share := 0.0
+		if disk > 0 {
+			share = 100 * float64(cold) / float64(disk)
+		}
+		fmt.Printf("zu2 tier: cold %.1f MiB of %.1f MiB on disk (%.0f%%), span %.1f MiB, migrated %.1f MiB\n",
+			float64(cold)/mib, float64(disk)/mib, share,
+			float64(C.zu2_cold_span(db.db))/mib, float64(migrated)/mib)
+	}
+
 	slots := buckets * 8
 	load := 0.0
 	if slots > 0 {
