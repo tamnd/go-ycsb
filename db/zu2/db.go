@@ -102,8 +102,19 @@ const (
 	// hint that is too small costs growths rather than correctness, and
 	// a load that knows its record count still saves those by saying so.
 	// max_nodes is sized once and not grown.
-	zu2IndexBuckets       = "zu2.index_buckets"
-	zu2MaxPages           = "zu2.max_pages"
+	zu2IndexBuckets = "zu2.index_buckets"
+	zu2MaxPages     = "zu2.max_pages"
+	// Pages of log held in memory, 4 MiB each. Unset means the engine
+	// default, which is no bound at all: zu2 heap allocates every page
+	// it appends to and frees one only when eviction drops it, so a
+	// database that never evicts holds all of itself in the process. At
+	// 200000 records on server3 that was 230 MiB of a 247 MiB database
+	// against sqlite serving the same data out of 20 MiB, and setting
+	// this is the whole of the fix. tamnd/zu#636.
+	//
+	// The engine clamps it up to one more than the mutable window, so
+	// five is the smallest setting that means anything.
+	zu2MemoryPages        = "zu2.memory_pages"
 	zu2MaxNodes           = "zu2.max_nodes"
 	zu2SpaceTargetPercent = "zu2.space_target_percent"
 	zu2CompactBelow       = "zu2.compact_below"
@@ -216,6 +227,9 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 	if v := p.GetUint64(zu2MaxPages, 0); v != 0 {
 		opt.max_pages = C.uint64_t(v)
+	}
+	if v := p.GetUint64(zu2MemoryPages, 0); v != 0 {
+		opt.memory_pages = C.uint64_t(v)
 	}
 	if v := p.GetUint64(zu2MaxNodes, 0); v != 0 {
 		opt.max_nodes = C.uint64_t(v)
