@@ -30,6 +30,19 @@ mkdir -p "$WORK"
 BIN="${BIN:-$WORK/ycsb-$ENGINE}"
 OUT="${OUT:-$WORK/$ENGINE-r$RECORDS-t$THREADS.tsv}"
 
+# Records a loader hands over at once. One is go-ycsb's own default and
+# is what every sweep so far has run at, so it stays the default here:
+# it is the shape every engine can do and the only one two of them can.
+# Above one the client calls BatchInsert instead of Insert, which sqlite,
+# duckdb, zu and zu2 implement and ladybug, pg and neo4j do not, so a
+# batched pass is a comparison between those four and not a sweep. What
+# it measures is the load path rather than the engine: zu2's batch entry
+# point waits for the device once for the batch instead of once a record,
+# which is the wait a loader did not ask for. See tamnd/zu#377.
+BATCH="${BATCH:-1}"
+BATCH_ARGS=()
+[ "$BATCH" -gt 1 ] && BATCH_ARGS=(-p "batch.size=$BATCH")
+
 if [ ! -x "$BIN" ]; then
   echo "no binary at $BIN, run scripts/build-engine.sh $ENGINE first" >&2
   exit 1
@@ -109,7 +122,7 @@ field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
   echo "# cpu: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || sysctl -n machdep.cpu.brand_string 2>/dev/null)"
   echo "# cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu)"
   echo "# loadavg at start: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
-  echo "# records: $RECORDS threads: $THREADS"
+  echo "# records: $RECORDS threads: $THREADS batch: $BATCH"
   echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } | tee "$OUT"
 
@@ -269,12 +282,12 @@ for w in a b c d e f; do
 
   reset_data
 
-  raw=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
+  raw=$("$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" \
     -p recordcount="$RECORDS" -p threadcount="$THREADS" 2>&1)
   load_out=$(grep -E '^(INSERT|TOTAL) ' <<<"$raw")
   if [ -z "$load_out" ]; then
     echo "# load failed for workload $w, see $WORK/$ENGINE-fail-$w.log" | tee -a "$OUT"
-    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" \
+    "$BIN" load "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}" "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" \
       -p recordcount="$RECORDS" -p threadcount="$THREADS" > "$WORK/$ENGINE-fail-$w.log" 2>&1
     continue
   fi
