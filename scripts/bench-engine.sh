@@ -282,6 +282,14 @@ space() {  # space <workload> <phase>
   awk -v w="$1" -v p="$2" -v e="$ENGINE" -v kb="$kb" -v n="$RECORDS" \
     'BEGIN { printf "# %s %s: %s on device %.1f MiB, %.0f bytes a record\n", w, p, e, kb / 1024, kb * 1024 / n }' \
     | tee -a "$OUT"
+  # And the same total broken out per file, because a single figure that
+  # disagrees with the engine's own cannot say which file the difference
+  # is in. #631 is 27.9 MiB of disagreement at a million records and it
+  # has not reproduced in process, so the next time it appears the log
+  # should already carry enough to name it.
+  du -k "$DATA".* 2>/dev/null | sort -k2 | awk -v w="$1" -v p="$2" -v e="$ENGINE" \
+    '{ printf "# %s %s: %s file %s %.1f MiB\n", w, p, e, $2, $1 / 1024 }' \
+    | tee -a "$OUT"
   return 0
 }
 
