@@ -171,26 +171,20 @@ type session struct {
 	arena carena
 	pairs cpairs
 	off   []int
-	// Where a scan's rows are copied to. One buffer per session that
-	// grows to the largest scan and is then reused, instead of a
-	// C.GoBytes per row: workload E returns fifty rows a scan and each
-	// GoBytes is an allocation the collector then has to take back.
-	rows []byte
-	// The same for a point read: one buffer and one map a session,
-	// reused, rather than a C.GoBytes and a makemap per read. Between
-	// them those two were thirty percent of a thirty two thread run
-	// (#678). See Read for what the caller is promised about them.
-	row  []byte
+	// One map a session for a point read, reused, rather than a makemap
+	// per read: that was a third of a thirty two thread run (#678). The
+	// row bytes need no buffer here at all, Read decodes straight out of
+	// the engine's. See Read for what the caller is promised.
 	vals map[string][]byte
 	// And the same again for a scan, one map a row rather than one a
 	// session because the caller gets every row of a scan at once and
 	// they have to be live together. The slice and the maps in it both
 	// grow to the largest scan and are then reused. Workload E returns
 	// fifty rows a scan, so this is fifty makemaps an operation that
-	// the collector does not have to take back afterwards. The rows
-	// already point into s.rows, so a caller that holds them past the
-	// next call on this session was already reading a reused buffer and
-	// this promises it nothing new.
+	// the collector does not have to take back afterwards. The values in
+	// them point into the engine's own scan buffer, so a caller holding
+	// them past the next call on this session is reading a buffer that
+	// has moved on, which is the lifetime the C API states.
 	scanVals []map[string][]byte
 	scanRows []map[string][]byte
 	// And once more for a batch read, which is the same problem again:
@@ -451,13 +445,12 @@ func dbErr(db *C.zu2_db, st C.zu2_status, fallback string) error {
 	return fmt.Errorf("%s (status %d)", fallback, int(st))
 }
 
-// readOne is a read with the caller saying where the row bytes and the
-// decoded fields land. Read points both at storage the session keeps and
-// reuses, since it hands back one row at a time. BatchRead gives every
-// key of the batch its own, since it hands back all of them together.
-//
-// The buffer comes back out because appending to it may move it.
-func (db *zu2DB) readOne(s *session, table string, key string, fields []string, buf []byte, into map[string][]byte) (map[string][]byte, []byte, error) {
+// rawRead looks one row up and hands back the engine's own bytes. The
+// slice points into storage that belongs to the session and is good only
+// until the next call on that session, so a caller that needs it to
+// outlive that has to copy it. A nil slice with a nil error means the key
+// is not there.
+func (db *zu2DB) rawRead(s *session, table string, key string) ([]byte, error) {
 	rk := s.rowKey(table, key)
 
 	var val *C.uint8_t
@@ -465,36 +458,48 @@ func (db *zu2DB) readOne(s *session, table string, key string, fields []string, 
 	var found C.int
 	st := C.zu2_read(s.s, ptr(rk), C.size_t(len(rk)), &val, &valLen, &found)
 	if st != C.ZU2_OK {
-		return nil, buf, sessionErr(s.s, st, fmt.Sprintf("zu2: read %q failed", key))
+		return nil, sessionErr(s.s, st, fmt.Sprintf("zu2: read %q failed", key))
 	}
 	if found == 0 {
-		return nil, buf, nil
+		return nil, nil
 	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen)), nil
+}
 
-	// A copy, and it has to be: the engine's buffer belongs to the
-	// session and is valid only until the next call on it, and the row
-	// decoder hands back sub slices of whatever it is given.
-	//
-	// It goes into a buffer this session keeps rather than into a fresh
-	// one, and the fields are decoded into a map this session keeps
-	// rather than a fresh one, so a read allocates nothing once the two
-	// have grown. What the caller gets in exchange is the same promise
-	// Scan already makes here: the map and the values in it are good
-	// until the next call on this connection, which for a go-ycsb
-	// worker is the rest of the operation it is in the middle of.
-	buf = append(buf[:0], unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen))...)
+// readOne is BatchRead's read, and it copies. It has to: the batch hands
+// every row back together, and each read overwrites the engine buffer the
+// one before it was pointing at, so by the time the batch returns only
+// the last row would still be readable.
+//
+// The copy goes into a buffer this session keeps for that key's position
+// in the batch rather than into a fresh one, and the fields are decoded
+// into a map it keeps too, so a warm batch allocates nothing. The buffer
+// comes back out because appending to it may move it.
+func (db *zu2DB) readOne(s *session, table string, key string, fields []string, buf []byte, into map[string][]byte) (map[string][]byte, []byte, error) {
+	row, err := db.rawRead(s, table, key)
+	if err != nil || row == nil {
+		return nil, buf, err
+	}
+	buf = append(buf[:0], row...)
 	m, err := db.r.DecodeInto(buf, fields, into)
 	return m, buf, err
 }
 
+// Read decodes out of the engine's buffer with no copy in between. The
+// decoded values are sub slices of it, so they are good until the next
+// call on this connection, which is the same promise Scan makes and is
+// the rest of the operation the worker is in the middle of. BatchRead
+// cannot do this and does not, see readOne.
 func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	s := sessionOf(ctx)
 	if s.vals == nil {
 		s.vals = make(map[string][]byte, 16)
 	}
-	m, buf, err := db.readOne(s, table, key, fields, s.row, s.vals)
-	s.row = buf
-	return m, err
+	row, err := db.rawRead(s, table, key)
+	if err != nil || row == nil {
+		return nil, err
+	}
+	return db.r.DecodeInto(row, fields, s.vals)
 }
 
 // Scan hands back up to count records at or after table:startKey in key
@@ -508,8 +513,8 @@ func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []st
 //
 // One crossing for the whole scan rather than one per row. The engine
 // fills a buffer of key and value pairs that belongs to the session and
-// lasts exactly until the next call on it, so this copies each value out
-// before it decodes, the same reason Read copies.
+// lasts exactly until the next call on it, and this decodes out of that
+// buffer rather than out of a copy of it, the same as Read.
 func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
 	if count <= 0 {
 		return nil, nil
@@ -527,33 +532,25 @@ func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count 
 		return nil, nil
 	}
 
-	// The rows are copied into one buffer and the decoded values then
-	// point into it, so the whole scan costs one copy and one growth
-	// rather than a copy and an allocation a row. The buffer belongs to
-	// the session and the next scan on the session overwrites it, which
-	// is the same lifetime the caller already had: the pairs point into
-	// the engine's own scan buffer and that is overwritten too.
+	// The decoded values point straight into the engine's own scan
+	// buffer rather than into a copy of it. That used to be a copy into
+	// a buffer this session kept, and the comment justifying it conceded
+	// the thing that makes it unnecessary: both buffers last exactly
+	// until the next call on this session, so the copy bought no
+	// lifetime that the caller did not already have. The C API says so
+	// itself, `*pairs` is the session's own array and is good until the
+	// next call on this session. Fifty rows of a thousand bytes is fifty
+	// kilobytes of memcpy a scan, and workload e is nothing but scans.
 	all := unsafe.Slice(pairs, int(returned))
-	total := 0
-	for _, pair := range all {
-		total += int(pair.value_len)
-	}
-	if cap(s.rows) < total {
-		s.rows = make([]byte, total)
-	}
-	s.rows = s.rows[:total]
 
 	prefix := []byte(table + ":")
 	got := s.scanRows[:0]
-	at := 0
 	for _, pair := range all {
 		key := unsafe.Slice((*byte)(unsafe.Pointer(pair.key)), int(pair.key_len))
 		if !bytes.HasPrefix(key, prefix) {
 			break
 		}
-		row := s.rows[at : at+int(pair.value_len)]
-		copy(row, unsafe.Slice((*byte)(unsafe.Pointer(pair.value)), int(pair.value_len)))
-		at += int(pair.value_len)
+		row := unsafe.Slice((*byte)(unsafe.Pointer(pair.value)), int(pair.value_len))
 		// One map per row position, kept between scans. The map at
 		// position i belongs to row i of this scan and DecodeInto
 		// clears it, so nothing of the previous scan's row i is left
