@@ -129,15 +129,25 @@ func (db *boltDB) Read(ctx context.Context, table string, key string, fields []s
 			return fmt.Errorf("key not found: %s.%s", table, key)
 		}
 
+		// Copied before the decode. bolt says the value Get returns is
+		// valid only for the life of the transaction, and the decode
+		// sub-slices rather than copying (decodeBytes ends `return
+		// remain[n:], remain[:n], nil`), so without this the map handed
+		// back points into the mapping after the transaction is done with
+		// it. Same defect as a1f84f2 and ca572fb, tamnd/zu#726.
 		var err error
-		m, err = db.r.Decode(row, fields)
+		m, err = db.r.Decode(append([]byte(nil), row...), fields)
 		return err
 	})
 	return m, err
 }
 
 func (db *boltDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	res := make([]map[string][]byte, count)
+	// Appended rather than sized to count. Sizing it left every position a
+	// short scan did not reach as a nil map, so a scan that found ten rows
+	// returned ten rows and forty nils and the caller could not tell a row
+	// that was not there from a row that was empty.
+	res := make([]map[string][]byte, 0, count)
 	err := db.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(table))
 		if bucket == nil {
@@ -146,14 +156,15 @@ func (db *boltDB) Scan(ctx context.Context, table string, startKey string, count
 
 		cursor := bucket.Cursor()
 		key, value := cursor.Seek([]byte(startKey))
-		for i := 0; key != nil && i < count; i++ {
-			m, err := db.r.Decode(value, fields)
+		for ; key != nil && len(res) < count; key, value = cursor.Next() {
+			// Copied for the reason Read copies it, and here it is fifty
+			// rows an operation rather than one.
+			m, err := db.r.Decode(append([]byte(nil), value...), fields)
 			if err != nil {
 				return err
 			}
 
-			res[i] = m
-			key, value = cursor.Next()
+			res = append(res, m)
 		}
 
 		return nil
