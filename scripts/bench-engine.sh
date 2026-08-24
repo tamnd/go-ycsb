@@ -246,6 +246,7 @@ fi
   echo "# cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu)"
   echo "# loadavg at start: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
   echo "# records: $RECORDS threads: $THREADS batch: $BATCH"
+  [ -n "${YCSB_EXTRA:-}" ] && echo "# extra: $YCSB_EXTRA"
   [ -z "$TIME_BIN" ] && echo "# no /usr/bin/time -v here, so there is no memory column in this file"
   echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 } | tee "$OUT"
@@ -819,6 +820,14 @@ for w in ${WORKLOADS:-a b c d e f}; do
   EXTRA=()
   if [ "$ENGINE" = zu2 ] && [ "$w" = e ]; then
     EXTRA=(-p "zu2.ordered=true")
+  fi
+  # Whatever the caller wants to vary, appended last so it wins over
+  # everything above. Word split on purpose: this is a string of
+  # arguments, YCSB_EXTRA="-p fieldcount=1 -p fieldlength=1000", and a
+  # run that uses it says so in its own header below.
+  if [ -n "${YCSB_EXTRA:-}" ]; then
+    # shellcheck disable=SC2206
+    EXTRA+=($YCSB_EXTRA)
   fi
 
   reset_data
