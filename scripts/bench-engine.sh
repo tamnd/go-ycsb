@@ -130,6 +130,13 @@ case "$ENGINE" in
     # inline or push every value out.
     ENGINE_ARGS=(-p "badger.dir=$DATA.badger")
     ;;
+  lmdb)
+    # map_size is the only thing that has to be set from out here, and
+    # only because the default has to cover a sweep at any record count
+    # this script is given. Everything else takes the adapter's
+    # defaults, which are no fsync and a writable map.
+    ENGINE_ARGS=(-p "lmdb.dir=$DATA.lmdb")
+    ;;
   pebble)
     # Everything else takes the adapter's defaults, which are Pebble's
     # own except for the block cache. Eight MiB is the library default
@@ -171,6 +178,7 @@ reset_data() {
                    "$DATA.lbug.checkpoint.apply.lock" \
                    "$DATA.lbug.checkpoint.intent.lock" ;;
     badger)  rm -rf "$DATA.badger" ;;
+    lmdb)    rm -rf "$DATA.lmdb" ;;
     pebble)  rm -rf "$DATA.pebble" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # A zu2 database is a log and three sidecars beside it, and removing
@@ -433,7 +441,7 @@ space() {  # space <workload> <phase>
   # on gamingpc for workload b and the log said nothing.
   if [ "${kb:-0}" -le 0 ]; then
     case "$ENGINE" in
-      sqlite|duckdb|ladybug|badger|pebble|zu|zu2)
+      sqlite|duckdb|ladybug|badger|pebble|lmdb|zu|zu2)
         echo "# $1 $2: WRONG, $ENGINE left nothing at $DATA.*" | tee -a "$OUT"
         ;;
     esac
