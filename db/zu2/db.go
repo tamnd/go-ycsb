@@ -171,10 +171,11 @@ type session struct {
 	arena carena
 	pairs cpairs
 	off   []int
-	// One map a session for a point read, reused, rather than a makemap
-	// per read: that was a third of a thirty two thread run (#678). The
-	// row bytes need no buffer here at all, Read decodes straight out of
-	// the engine's. See Read for what the caller is promised.
+	// The same for a point read: one buffer and one map a session,
+	// reused, rather than a C.GoBytes and a makemap per read. Between
+	// them those two were thirty percent of a thirty two thread run
+	// (#678). See readOne for what the caller is promised about them.
+	row  []byte
 	vals map[string][]byte
 	// And the same again for a scan, one map a row rather than one a
 	// session because the caller gets every row of a scan at once and
@@ -466,15 +467,26 @@ func (db *zu2DB) rawRead(s *session, table string, key string) ([]byte, error) {
 	return unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen)), nil
 }
 
-// readOne is BatchRead's read, and it copies. It has to: the batch hands
-// every row back together, and each read overwrites the engine buffer the
-// one before it was pointing at, so by the time the batch returns only
-// the last row would still be readable.
+// readOne is a read with the caller saying where the row bytes and the
+// decoded fields land. Read points both at storage the session keeps and
+// reuses, since it hands back one row at a time. BatchRead gives every
+// key of the batch its own, since it hands back all of them together.
 //
-// The copy goes into a buffer this session keeps for that key's position
-// in the batch rather than into a fresh one, and the fields are decoded
-// into a map it keeps too, so a warm batch allocates nothing. The buffer
-// comes back out because appending to it may move it.
+// The copy stays here, unlike in Scan, and the two are not inconsistent.
+// zu2_scan documents the lifetime of what it hands back, the pair array
+// is the session's own and is good until the next call on this session,
+// so decoding out of it is decoding out of something with a stated
+// contract. zu2_read documents no lifetime at all. Its buffer happens to
+// be a different one that only another read disturbs, so skipping the
+// copy happens to work today, and read-modify-write is the case that
+// shows why happening to work is not enough: it reads, then updates on
+// the same session, then looks at the row it read. A copy is a thousand
+// bytes and a point read is microseconds, so what that buys is a couple
+// of percent against a correctness cliff that moves the day somebody
+// makes an upsert reuse that buffer. Not worth it. If zu2_read grows the
+// promise zu2_scan already makes, this comes out.
+//
+// The buffer comes back out because appending to it may move it.
 func (db *zu2DB) readOne(s *session, table string, key string, fields []string, buf []byte, into map[string][]byte) (map[string][]byte, []byte, error) {
 	row, err := db.rawRead(s, table, key)
 	if err != nil || row == nil {
@@ -485,21 +497,14 @@ func (db *zu2DB) readOne(s *session, table string, key string, fields []string, 
 	return m, buf, err
 }
 
-// Read decodes out of the engine's buffer with no copy in between. The
-// decoded values are sub slices of it, so they are good until the next
-// call on this connection, which is the same promise Scan makes and is
-// the rest of the operation the worker is in the middle of. BatchRead
-// cannot do this and does not, see readOne.
 func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	s := sessionOf(ctx)
 	if s.vals == nil {
 		s.vals = make(map[string][]byte, 16)
 	}
-	row, err := db.rawRead(s, table, key)
-	if err != nil || row == nil {
-		return nil, err
-	}
-	return db.r.DecodeInto(row, fields, s.vals)
+	m, buf, err := db.readOne(s, table, key, fields, s.row, s.vals)
+	s.row = buf
+	return m, err
 }
 
 // Scan hands back up to count records at or after table:startKey in key
