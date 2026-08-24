@@ -176,6 +176,12 @@ type session struct {
 	// C.GoBytes per row: workload E returns fifty rows a scan and each
 	// GoBytes is an allocation the collector then has to take back.
 	rows []byte
+	// The same for a point read: one buffer and one map a session,
+	// reused, rather than a C.GoBytes and a makemap per read. Between
+	// them those two were thirty percent of a thirty two thread run
+	// (#678). See Read for what the caller is promised about them.
+	row  []byte
+	vals map[string][]byte
 }
 
 type zu2DB struct {
@@ -442,13 +448,22 @@ func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []st
 		return nil, nil
 	}
 
-	// A copy, and it has to be. The buffer belongs to the session and
-	// is valid only until the next call on it, and the row decoder
-	// hands back sub slices of whatever it is given, so decoding in
-	// place would leave the caller holding windows into a buffer the
-	// next read overwrites.
-	row := C.GoBytes(unsafe.Pointer(val), C.int(valLen))
-	return db.r.Decode(row, fields)
+	// A copy, and it has to be: the engine's buffer belongs to the
+	// session and is valid only until the next call on it, and the row
+	// decoder hands back sub slices of whatever it is given.
+	//
+	// It goes into a buffer this session keeps rather than into a fresh
+	// one, and the fields are decoded into a map this session keeps
+	// rather than a fresh one, so a read allocates nothing once the two
+	// have grown. What the caller gets in exchange is the same promise
+	// Scan already makes here: the map and the values in it are good
+	// until the next call on this connection, which for a go-ycsb
+	// worker is the rest of the operation it is in the middle of.
+	s.row = append(s.row[:0], unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen))...)
+	if s.vals == nil {
+		s.vals = make(map[string][]byte, 16)
+	}
+	return db.r.DecodeInto(s.row, fields, s.vals)
 }
 
 // Scan hands back up to count records at or after table:startKey in key

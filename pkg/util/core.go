@@ -77,11 +77,35 @@ func NewRowCodec(p *properties.Properties) *RowCodec {
 // which made it the largest cost in workload E for every engine that
 // keeps rows in this encoding.
 func (r *RowCodec) Decode(row []byte, fields []string) (map[string][]byte, error) {
+	return r.DecodeInto(row, fields, nil)
+}
+
+// DecodeInto is Decode into a map the caller keeps and hands back.
+//
+// A decoded row costs a map allocation and one insertion a field, and
+// on a read heavy workload the allocation is the larger half of that: a
+// thirty two thread profile of zu2 through this harness put makemap at
+// 16.4 percent of the run and the insertions at 5.8. A driver that
+// keeps one map a session and passes it here pays the insertions only.
+//
+// `into` is cleared first, so what comes back holds this row and no
+// part of the row before it. A driver that reuses a map this way is
+// promising its caller that the map is good until the next call on the
+// same connection, which is the same promise it already makes about a
+// value that points into a reused buffer.
+//
+// A nil `into` allocates, which is what Decode does.
+func (r *RowCodec) DecodeInto(row []byte, fields []string, into map[string][]byte) (map[string][]byte, error) {
 	if len(fields) == 0 {
 		fields = r.fields
 	}
 
-	res := make(map[string][]byte, len(fields))
+	res := into
+	if res == nil {
+		res = make(map[string][]byte, len(fields))
+	} else {
+		clear(res)
+	}
 	all := len(fields) == len(r.fields)
 	err := EachColumn(row, func(id int64, value []byte) {
 		if id < 0 || int(id) >= len(r.fieldNames) {

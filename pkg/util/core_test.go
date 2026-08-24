@@ -1,6 +1,7 @@
 package util
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
@@ -71,5 +72,54 @@ func TestDecodeMatchesTheRowMap(t *testing.T) {
 	}
 	if len(empty) != 0 {
 		t.Errorf("an empty row came back as %v", empty)
+	}
+}
+
+// A reused map has to decode to what a fresh one decodes to, and has to
+// hold this row and nothing of the row before it.
+func TestDecodeIntoMatchesDecode(t *testing.T) {
+	p := properties.NewProperties()
+	if _, _, err := p.Set("fieldcount", "10"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	c := NewRowCodec(p)
+
+	rows := make([][]byte, 3)
+	for i := range rows {
+		values := map[string][]byte{}
+		// The third row is short, so a stale entry from the second
+		// would survive into it if the map were not cleared.
+		n := 10
+		if i == 2 {
+			n = 3
+		}
+		for f := 0; f < n; f++ {
+			values[fmt.Sprintf("field%d", f)] = []byte(fmt.Sprintf("row%d-value%d", i, f))
+		}
+		row, err := c.Encode(nil, values)
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		rows[i] = row
+	}
+
+	reused := make(map[string][]byte, 16)
+	for i, row := range rows {
+		want, err := c.Decode(row, nil)
+		if err != nil {
+			t.Fatalf("decode row %d: %v", i, err)
+		}
+		got, err := c.DecodeInto(row, nil, reused)
+		if err != nil {
+			t.Fatalf("decode into row %d: %v", i, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("row %d: got %d fields want %d", i, len(got), len(want))
+		}
+		for k, v := range want {
+			if !bytes.Equal(got[k], v) {
+				t.Errorf("row %d field %s: got %q want %q", i, k, got[k], v)
+			}
+		}
 	}
 }
