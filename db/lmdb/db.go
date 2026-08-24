@@ -88,17 +88,33 @@ func (c lmdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	// synchronous_commit=off, pebble and badger with sync off, MongoDB at
 	// w=1 with no j. None of these numbers is a durability claim.
 	//
-	// WriteMap on by default. It maps the database writable and a write
-	// then goes straight into the map instead of through a private page
-	// copy, which is most of what LMDB's write path costs, and the price
-	// is that a stray pointer in the process can corrupt the database.
-	// That is a real price for a server and not one for a benchmark
-	// process that does nothing else.
+	// WriteMap off by default, which is the opposite of what this said
+	// when it was written and is the result of measuring it. Mapping the
+	// database writable lets a write go straight into the map instead of
+	// through a private page copy, and on a load, which appends in
+	// roughly ascending key order, that is worth 3.2x: 159405 inserts a
+	// second against 49149 at a million records and 32 threads.
+	//
+	// On random updates over a dataset that no longer fits in the page
+	// cache it collapses. The same host, the same store, workload a at a
+	// million records and 32 threads: 523 operations a second with it on
+	// and 85818 with it off, which is 164x. Reads are 2 microseconds in
+	// both, so it is entirely the write path. Every thread but one sits
+	// in a futex while the one holding the writer lock is down in the
+	// filesystem journal, because a copy on write B+tree scatters its
+	// dirty pages across the file and each one landing in a hole is a
+	// block allocation taken in the fault path rather than by the
+	// writeback thread. Raising map_size to something near the working
+	// set helps by 3.3x and does not fix it.
+	//
+	// So the default is the one that is merely slower rather than the
+	// one that is sometimes catastrophic, and the fast path stays
+	// available to anyone who knows their working set fits. tamnd/zu#709.
 	flags := uint(0)
 	if !p.GetBool(lmdbSync, false) {
 		flags |= lmdb.NoSync | lmdb.NoMetaSync
 	}
-	if p.GetBool(lmdbWriteMap, true) {
+	if p.GetBool(lmdbWriteMap, false) {
 		flags |= lmdb.WriteMap
 	}
 	if p.GetBool(lmdbNoReadahead, false) {

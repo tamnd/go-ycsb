@@ -41,7 +41,11 @@
 //	go build -tags lmdb -o ycsb-lmdb ./cmd/go-ycsb
 //	./ycsb-lmdb load lmdb -P workloads/workloadc -p lmdb.dir=/tmp/lmdb
 //
-// The one property worth knowing about is lmdb.map_size. LMDB reserves
+// Two properties are worth knowing about. lmdb.write_map is off by
+// default and turning it on is worth 3.2x on a load and costs 164x on
+// random updates once the dataset outgrows the page cache, which is
+// measured in tamnd/zu#709 and explained in the adapter. The other is
+// lmdb.map_size. LMDB reserves
 // its address space up front and a database that grows past the map
 // fails the write rather than growing, so the adapter reserves sixteen
 // GiB by default. The file is sparse and the space column measures what
