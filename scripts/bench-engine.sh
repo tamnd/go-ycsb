@@ -274,6 +274,73 @@ storage() {  # storage <workload> <phase> <output>
 # gone, and before the next workload wipes the path.
 space() {  # space <workload> <phase>
   local kb
+
+  # The three engines that keep their data inside a container have no
+  # $DATA path to measure, so they used to print a sentence saying so and
+  # drop out of the storage comparison entirely. That left the compact
+  # storage question answered for four engines out of seven. Each one can
+  # be asked directly, and what each one answers with is not quite the
+  # same thing, so the line says which:
+  #
+  #   pg       pg_total_relation_size, the table with its indexes and toast
+  #   mongodb  the collection's storage size with its indexes
+  #   neo4j    du of the database directory, which is the store, the
+  #            indexes and the transaction logs together
+  #
+  # None of them is directly comparable to sqlite's file to the byte, and
+  # all three are the closest thing that engine has to one.
+  case "$ENGINE" in
+    pg|mongodb|neo4j)
+      # Each one is asked to get what it is holding onto out to the device
+      # first. Without that, what comes back is whatever has landed so
+      # far: WiredTiger's storageSize is the size of the file on disk and
+      # it does not move until a checkpoint, which by default is a minute
+      # away, so a collection with 2000 records freshly loaded reported
+      # 8000 bytes and read as 4 bytes a record. The engines measured with
+      # du are read after their writes have gone down, and this is the
+      # same thing asked of the ones that answer for themselves.
+      local bytes="" what="" parts=""
+      case "$ENGINE" in
+        pg)
+          docker exec pg-ycsb psql -U postgres -d ycsb -tAc 'checkpoint' >/dev/null 2>&1
+          bytes=$(docker exec pg-ycsb psql -U postgres -d ycsb -tAc \
+                    "select pg_total_relation_size('usertable')" 2>/dev/null | tr -d '[:space:]')
+          parts=$(docker exec pg-ycsb psql -U postgres -d ycsb -tAF' ' -c \
+                    "select 'table', pg_table_size('usertable') union all select 'indexes', pg_indexes_size('usertable')" 2>/dev/null)
+          what="table with indexes and toast" ;;
+        mongodb)
+          docker exec mongo-ycsb mongosh --quiet --eval 'db.adminCommand({fsync:1})' >/dev/null 2>&1
+          parts=$(docker exec mongo-ycsb mongosh "mongodb://127.0.0.1:27017/ycsb" --quiet \
+                    --eval "const s = db.getCollection('usertable').aggregate([{\$collStats:{storageStats:{}}}]).toArray()[0].storageStats; print('collection ' + s.storageSize); print('indexes ' + s.totalIndexSize)" 2>/dev/null)
+          bytes=$(awk '{ s += $2 } END { print s + 0 }' <<<"$parts")
+          what="collection with indexes" ;;
+        neo4j)
+          # The transaction log directory is preallocated to a fixed size
+          # and does not track the data at all: a thousand records came
+          # to 10.9 MiB of store beside 514 MiB of log. The total is what
+          # is on the device and stays the headline, the same as every
+          # other engine here, and the split below is what stops it being
+          # read as half a megabyte a record.
+          parts=$(docker exec neo4j-ycsb du -sk /data/databases /data/transactions 2>/dev/null \
+                    | awk '{ printf "%s %d\n", ($2 ~ /transactions/ ? "transactionlogs" : "store"), $1 * 1024 }')
+          bytes=$(awk '{ s += $2 } END { print s + 0 }' <<<"$parts")
+          what="store, indexes and transaction logs" ;;
+      esac
+      if [[ "$bytes" =~ ^[0-9]+$ ]] && [ "$bytes" -gt 0 ]; then
+        awk -v w="$1" -v p="$2" -v e="$ENGINE" -v b="$bytes" -v n="$RECORDS" -v what="$what" \
+          'BEGIN { printf "# %s %s: %s on device %.1f MiB, %.0f bytes a record (%s)\n", w, p, e, b / 1048576, b / n, what }' \
+          | tee -a "$OUT"
+        # The same breakdown the local engines get per file, because a
+        # single figure cannot say which part of it moved.
+        awk -v w="$1" -v p="$2" -v e="$ENGINE" \
+          'NF == 2 && $2 ~ /^[0-9]+$/ { printf "# %s %s: %s %s %.1f MiB\n", w, p, e, $1, $2 / 1048576 }' \
+          <<<"$parts" | tee -a "$OUT"
+      else
+        echo "# $1 $2: $ENGINE would not say how much space it is using" | tee -a "$OUT"
+      fi
+      return 0 ;;
+  esac
+
   kb="$(du -sk "$DATA".* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')"
   # A phase that reported throughput and left nothing on the device is not
   # a missing measurement, it is a result, and staying quiet about it reads

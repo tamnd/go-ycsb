@@ -358,11 +358,17 @@ func (db *sqliteDB) Read(ctx context.Context, table string, key string, fields [
 }
 
 func (db *sqliteDB) doScan(ctx context.Context, tx querier, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	// ORDER BY for the reason the duckdb driver gives. SQLite happens to
+	// walk the primary key index here and so was already returning rows
+	// in order, which is why the scan integrity check passes either way,
+	// but that is the plan it picked and not a promise it made. Asking
+	// for the order it is already producing costs nothing and stops the
+	// answer depending on a plan choice.
 	var query string
 	if len(fields) == 0 {
-		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, table)
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`, table)
 	} else {
-		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, strings.Join(fields, ","), table)
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`, strings.Join(fields, ","), table)
 	}
 
 	rows, err := db.doQueryRows(ctx, tx, query, count, startKey, count)
