@@ -59,6 +59,5 @@ func NewExponential(percentile float64, rng float64) *Exponential {
 // Next implements the Generator Next interface.
 func (e *Exponential) Next(r *rand.Rand) int64 {
 	v := int64(-math.Log(r.Float64()) / e.gamma)
-	e.SetLastValue(v)
 	return v
 }

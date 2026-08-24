@@ -71,6 +71,5 @@ func (s *ScrambledZipfian) Next(r *rand.Rand) int64 {
 	n := s.gen.Next(r)
 
 	n = s.min + util.Hash64(n)%s.itemCount
-	s.SetLastValue(n)
 	return n
 }
