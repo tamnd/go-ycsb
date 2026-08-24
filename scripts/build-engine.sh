@@ -92,7 +92,12 @@ for e in "${ENGINES[@]}"; do
     ldflags="$ldflags -L${LBUG_LIB:-/usr/local/lib} -llbug -lssl -lcrypto -latomic -lstdc++ -lm -ldl -Wl,-rpath,${LBUG_LIB:-/usr/local/lib}"
   fi
 
-  echo "building $WORK/ycsb-$e${tag:+ (tag $tag)}"
+  # Print the flags. #689 was a compile flag that silently did not apply
+  # for weeks and cost sqlite most of its throughput in every table taken
+  # in that time, and the reason it went unnoticed is that nothing in the
+  # output said what the build was actually using. One line a build makes
+  # the next one of these visible in the log that the run already keeps.
+  echo "building $WORK/ycsb-$e${tag:+ (tag $tag)} cflags [$cflags] ldflags [$ldflags]"
   if [ -n "$tag" ]; then
     CGO_CFLAGS="$cflags" CGO_LDFLAGS="$ldflags" go build -tags "$tag" -o "$WORK/ycsb-$e" ./cmd/go-ycsb
   else
