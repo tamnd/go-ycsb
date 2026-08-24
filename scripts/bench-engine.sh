@@ -496,11 +496,83 @@ space() {  # space <workload> <phase>
 # Their data lives in a server process this script never started, so what
 # time sees is the client, and a client's footprint printed in a memory
 # column beside four embedded engines is worse than a blank.
+# Proportional set size, sampled while the phase runs.
+#
+# Maximum resident set size counts a shared file backed page once per
+# mapping and not once per page, so an engine that maps the same file
+# from several places has every resident page of it counted several
+# times. sqlite does exactly that: the adapter sets PRAGMA mmap_size per
+# connection and opens one connection per thread, so at 32 threads the
+# database is mapped 32 times and a 1.3 GiB database reported a 34.7 GiB
+# peak. That is not a leak and it is not a rival losing, it is the
+# column being wrong, and it was wrong in our favour, which is the worst
+# direction for a number to be wrong in. tamnd/zu#695.
+#
+# Pss divides each page by the number of mappings that hold it, so a
+# page mapped 32 times inside one process contributes its full size once
+# across those 32 mappings. Anonymous is the part that is not backed by
+# a file at all, which is the heap and the stacks and is the number to
+# look at when asking what an engine costs beyond the page cache it
+# shares with the kernel.
+#
+# Sampled rather than read at the end, because smaps_rollup only exists
+# while the process does. A tenth of a second is far finer than the
+# phases here, which run for seconds at least, and the sampler costs one
+# read of one small file per tick.
+#
+# Linux only. macOS has no smaps_rollup and no equivalent that is cheap
+# to sample, so there the memory line stays the RSS one it always was
+# and says so.
+PSS_FILE="$WORK/.pss-$ENGINE"
+
+pss_sample() {
+  local pid k v pss anon maxp=0 maxa=0
+  while :; do
+    # By process name and not by command line. /usr/bin/time carries the
+    # binary's path in its own arguments, so a -f match finds the wrapper
+    # as well as the process, and the wrapper's footprint is not the
+    # measurement.
+    pid="$(pgrep -x "ycsb-$ENGINE" 2>/dev/null | head -1)"
+    if [ -n "$pid" ] && [ -r "/proc/$pid/smaps_rollup" ]; then
+      pss=0; anon=0
+      while read -r k v _; do
+        case "$k" in
+          Pss:)       pss="$v" ;;
+          Anonymous:) anon="$v" ;;
+        esac
+      done < "/proc/$pid/smaps_rollup"
+      [ "${pss:-0}" -gt "$maxp" ] && maxp="$pss"
+      [ "${anon:-0}" -gt "$maxa" ] && maxa="$anon"
+      printf '%s %s\n' "$maxp" "$maxa" > "$PSS_FILE"
+    fi
+    sleep 0.1
+  done
+}
+
 timed() {  # timed <argv...>
   case "$ENGINE" in
-    pg|neo4j|mongodb|redis|valkey|keydb|garnet) "$@" ;;
-    *) if [ -n "$TIME_BIN" ]; then "$TIME_BIN" -v "$@"; else "$@"; fi ;;
+    pg|neo4j|mongodb|redis|valkey|keydb|garnet) "$@" ; return ;;
   esac
+
+  local sampler="" rc=0
+  rm -f "$PSS_FILE"
+  if [ -r /proc/self/smaps_rollup ]; then
+    # Output redirected away from the caller's. timed runs inside a
+    # command substitution, and a background job that keeps the write
+    # end of that pipe open holds the substitution open with it, so a
+    # sampler inheriting stdout hangs the phase rather than measuring
+    # it.
+    pss_sample >/dev/null 2>&1 &
+    sampler=$!
+  fi
+
+  if [ -n "$TIME_BIN" ]; then "$TIME_BIN" -v "$@"; else "$@"; fi
+  rc=$?
+
+  # The sampler writes its running maximum every tick, so killing it
+  # leaves the highest value it saw rather than losing the last one.
+  [ -n "$sampler" ] && kill "$sampler" 2>/dev/null
+  return $rc
 }
 
 maxrss() {  # maxrss <workload> <phase> <output>
@@ -522,6 +594,29 @@ maxrss() {  # maxrss <workload> <phase> <output>
   awk -v w="$1" -v p="$2" -v e="$ENGINE" -v kb="$kb" -v n="$RECORDS" \
     'BEGIN { printf "# %s %s: %s peak rss %.1f MiB, %.0f bytes a record\n", w, p, e, kb / 1024, kb * 1024 / n }' \
     | tee -a "$OUT"
+
+  # And the same phase measured the way #695 says it has to be. Pss is
+  # the line to compare engines on. RSS stays above it rather than being
+  # replaced, because the two disagreeing is itself the signal that an
+  # engine maps something more than once, and a reader of an old file
+  # needs the old column to compare against.
+  local pss anon
+  if [ -s "$PSS_FILE" ]; then
+    read -r pss anon < "$PSS_FILE"
+    awk -v w="$1" -v p="$2" -v e="$ENGINE" -v pss="${pss:-0}" -v anon="${anon:-0}" \
+        -v kb="$kb" -v n="$RECORDS" \
+      'BEGIN {
+         if (pss <= 0) exit
+         printf "# %s %s: %s peak pss %.1f MiB, %.0f bytes a record, anonymous %.1f MiB\n", \
+           w, p, e, pss / 1024, pss * 1024 / n, anon / 1024
+         if (kb > pss * 1.5)
+           printf "# %s %s: %s rss is %.1fx its pss, so it maps something more than once, see tamnd/zu#695\n", \
+             w, p, e, kb / pss
+       }' | tee -a "$OUT"
+  elif [ ! -r /proc/self/smaps_rollup ]; then
+    echo "# $1 $2: no smaps_rollup on this host, so the memory figure is rss and over counts shared mappings" \
+      | tee -a "$OUT"
+  fi
   return 0
 }
 
