@@ -16,6 +16,8 @@ package client
 import (
 	"context"
 	"fmt"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/pingcap/go-ycsb/pkg/measurement"
@@ -27,9 +29,28 @@ type DbWrapper struct {
 	DB ycsb.DB
 }
 
+// The first error each operation type produces, printed once.
+//
+// Before this the error was counted and then dropped on the floor: a
+// failing operation became a line called SCAN_ERROR in the summary with
+// a latency on it and nothing else, no message, no cause. An engine
+// whose scans all failed therefore looked like an engine with very fast
+// scans, and the only reason it was ever noticed is that #551 added the
+// rows against scans line at the end of a run. That is the same class of
+// hole #551 closed on the other side of this call, and this closes it
+// here.
+//
+// Once per operation type rather than every time, because an engine that
+// is failing at all is usually failing on every operation and a million
+// copies of one message is not more informative than one.
+var errOnce sync.Map
+
 func measure(ctx context.Context, start time.Time, op string, err error) {
 	lan := time.Now().Sub(start)
 	if err != nil {
+		if _, loaded := errOnce.LoadOrStore(op, struct{}{}); !loaded {
+			fmt.Fprintf(os.Stderr, "%s failed, first error of this kind: %v\n", op, err)
+		}
 		measurement.Measure(ctx, fmt.Sprintf("%s_ERROR", op), start, lan)
 		return
 	}
