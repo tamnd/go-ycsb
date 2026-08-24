@@ -75,8 +75,13 @@ type core struct {
 	orderedInserts               bool
 	recordCount                  int64
 	zeroPadding                  int64
-	insertionRetryLimit          int64
-	insertionRetryInterval       int64
+	// The key prefix, read once at construction. It used to be read
+	// out of the properties map on every key built, which is a string
+	// map lookup per operation for a value that cannot change, and it
+	// was five percent of the client's CPU. See tamnd/zu#645.
+	keyPrefix              string
+	insertionRetryLimit    int64
+	insertionRetryInterval int64
 
 	valuePool sync.Pool
 
@@ -179,13 +184,63 @@ func (c *core) Close() error {
 	return nil
 }
 
+// buildKeyName is the key for a key number: the prefix, then the number
+// left padded with zeros to `zeroPadding` digits.
+//
+// This used to be one `fmt.Sprintf` with an indexed dynamic width, which
+// is the slowest spelling `fmt` has, plus a properties lookup for the
+// prefix. Between them they were a quarter of what the client spends on
+// an operation before it reaches a driver, and the client's floor is
+// most of what every published throughput number measures (tamnd/zu#645).
+// Every byte this returns is the same byte the Sprintf returned, which
+// `TestBuildKeyNameMatchesSprintf` holds.
 func (c *core) buildKeyName(keyNum int64) string {
 	if !c.orderedInserts {
 		keyNum = util.Hash64(keyNum)
 	}
 
-	prefix := c.p.GetString(prop.KeyPrefix, prop.KeyPrefixDefault)
-	return fmt.Sprintf("%s%0[3]*[2]d", prefix, keyNum, c.zeroPadding)
+	// Big enough for the longest int64 with its sign and for any
+	// padding a sane run asks for, so the common case never allocates
+	// twice. A `zeroPadding` wider than this still comes out right, the
+	// append just grows the slice.
+	var stack [64]byte
+	buf := append(stack[:0], c.keyPrefix...)
+
+	// `fmt` puts the sign in front of the padding, so "%05d" of -42 is
+	// "-0042" and not "000-42", and the width is the whole field: the
+	// sign is one of the characters it counts, so "%02d" of -1 is "-1"
+	// and not "-01".
+	n := keyNum
+	width := int(c.zeroPadding)
+	if n < 0 {
+		buf = append(buf, '-')
+		width--
+	}
+	digits := 1
+	for m := n / 10; m != 0; m /= 10 {
+		digits++
+	}
+	for pad := width - digits; pad > 0; pad-- {
+		buf = append(buf, '0')
+	}
+	// Written from the back, because the digits come out least
+	// significant first. `-n` is not taken for the negative case:
+	// negating math.MinInt64 overflows, so the remainder is negated one
+	// digit at a time instead.
+	at := len(buf) + digits
+	if cap(buf) < at {
+		buf = append(buf, make([]byte, at-len(buf))...)
+	}
+	buf = buf[:at]
+	for i := at - 1; i >= at-digits; i-- {
+		d := n % 10
+		if d < 0 {
+			d = -d
+		}
+		buf[i] = byte('0' + d)
+		n /= 10
+	}
+	return string(buf)
 }
 
 func (c *core) buildSingleValue(state *coreState, key string) map[string][]byte {
@@ -657,6 +712,7 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 			c.recordCount, insertStart, insertCount)
 	}
 	c.zeroPadding = p.GetInt64(prop.ZeroPadding, prop.ZeroPaddingDefault)
+	c.keyPrefix = p.GetString(prop.KeyPrefix, prop.KeyPrefixDefault)
 	c.readAllFields = p.GetBool(prop.ReadAllFields, prop.ReadALlFieldsDefault)
 	c.writeAllFields = p.GetBool(prop.WriteAllFields, prop.WriteAllFieldsDefault)
 	c.dataIntegrity = p.GetBool(prop.DataIntegrity, prop.DataIntegrityDefault)
@@ -736,4 +792,14 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 func init() {
 	ycsb.RegisterWorkloadCreator("core", coreCreator{})
 	ycsb.RegisterWorkloadCreator("site.ycsb.workloads.CoreWorkload", coreCreator{})
+}
+
+// slowBuildKeyName is what buildKeyName used to be, kept so the tests
+// can hold the new one against it and the benchmark can price the
+// difference. Nothing on a run calls this.
+func (c *core) slowBuildKeyName(keyNum int64) string {
+	if !c.orderedInserts {
+		keyNum = util.Hash64(keyNum)
+	}
+	return fmt.Sprintf("%s%0[3]*[2]d", c.keyPrefix, keyNum, c.zeroPadding)
 }

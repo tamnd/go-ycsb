@@ -38,7 +38,21 @@ func Test_core_buildKeyName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := core{p: properties.MustLoadFiles([]string{"workloads/workloadc"}, properties.UTF8, false)}
+			// Built the way a run builds it, through the creator, so
+			// the fields buildKeyName reads are the fields a run sets.
+			// This used to be a bare `core{p: ...}`, which stopped
+			// being enough once the key prefix was read once at
+			// construction instead of once per key. The path is
+			// relative to this file because a package test runs in its
+			// own directory, and reading it from the repository root
+			// meant this test could not pass under `go test ./...` at
+			// all.
+			p := properties.MustLoadFiles([]string{"../../workloads/workloadc"}, properties.UTF8, false)
+			w, err := coreCreator{}.Create(p)
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			c := w.(*core)
 			if got := c.buildKeyName(tt.args.keyNum); got != tt.want {
 				t.Errorf("buildKeyName() = %v, want %v", got, tt.want)
 			}
