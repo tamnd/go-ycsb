@@ -156,13 +156,22 @@ func (db *badgerDB) Read(ctx context.Context, table string, key string, fields [
 			return err
 		}
 		// Value hands the stored bytes to a callback and they are only
-		// valid inside it, which is why the decode happens in there. The
-		// v1 API returned the slice directly and this adapter kept it
-		// past the transaction, which v4 will not allow.
-		return item.Value(func(row []byte) error {
-			m, err = db.r.Decode(row, fields)
+		// valid inside it, and this used to decode in there and keep the
+		// map, on the assumption that decoding inside the callback was
+		// enough. It is not: the decode sub-slices rather than copying,
+		// `decodeBytes` ends `return remain[n:], remain[:n], nil`, so the
+		// map that escaped the callback was full of pointers into badger's
+		// value log mapping.
+		//
+		// ValueCopy takes the copy the decode does not, which is also what
+		// Scan below has always done. It costs an allocation a read.
+		// tamnd/zu#726 covers giving that back into a thread owned buffer.
+		row, err := item.ValueCopy(nil)
+		if err != nil {
 			return err
-		})
+		}
+		m, err = db.r.Decode(row, fields)
+		return err
 	})
 
 	if err == badger.ErrKeyNotFound {

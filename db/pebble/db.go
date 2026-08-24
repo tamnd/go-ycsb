@@ -125,9 +125,17 @@ func (db *pebbleDB) rowKey(table string, key string) []byte {
 }
 
 func (db *pebbleDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
-	// Get hands back a slice that stays valid only until the closer runs,
-	// so the decode happens before it and the closer is not deferred past
-	// the point where the row is still being read.
+	// Get hands back a slice that stays valid only until the closer runs.
+	// Decoding before the close is not enough, which is what this used to
+	// do: the decode does not copy, it sub-slices. `DecodeInto` goes
+	// through `EachColumn` to `decodeBytes`, which ends `return
+	// remain[n:], remain[:n], nil`, so every value in the map returned
+	// here pointed into a buffer pebble had already taken back.
+	//
+	// So copy the row out first and decode the copy. That is an
+	// allocation a read this adapter was not paying, and it is what
+	// correctness costs. tamnd/zu#726 covers giving it back properly, into
+	// a buffer the thread owns rather than a fresh one each time.
 	value, closer, err := db.db.Get(db.rowKey(table, key))
 	if err == pebble.ErrNotFound {
 		return nil, nil
@@ -135,9 +143,9 @@ func (db *pebbleDB) Read(ctx context.Context, table string, key string, fields [
 	if err != nil {
 		return nil, err
 	}
-	m, err := db.r.Decode(value, fields)
+	row := append([]byte(nil), value...)
 	closer.Close()
-	return m, err
+	return db.r.Decode(row, fields)
 }
 
 func (db *pebbleDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
@@ -159,7 +167,11 @@ func (db *pebbleDB) Scan(ctx context.Context, table string, startKey string, cou
 	// scan as a full one with empty rows in it.
 	res := make([]map[string][]byte, 0, count)
 	for it.First(); it.Valid() && len(res) < count; it.Next() {
-		m, err := db.r.Decode(it.Value(), fields)
+		// Copied for the same reason Read copies: `it.Value()` is good
+		// only until the next `it.Next()`, and the decode sub-slices it
+		// rather than copying, so without this every row in the result but
+		// the last one pointed at bytes the iterator had moved off.
+		m, err := db.r.Decode(append([]byte(nil), it.Value()...), fields)
 		if err != nil {
 			return nil, err
 		}
