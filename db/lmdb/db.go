@@ -16,8 +16,8 @@
 package lmdb
 
 import (
+	"bytes"
 	"context"
-	"fmt"
 	"os"
 
 	"github.com/PowerDNS/lmdb-go/lmdb"
@@ -43,8 +43,86 @@ type lmdbDB struct {
 	env *lmdb.Env
 	dbi lmdb.DBI
 
-	r       *util.RowCodec
-	bufPool *util.BufPool
+	r *util.RowCodec
+}
+
+type ctxKey struct{}
+
+// state is the per thread scratch this adapter keeps.
+//
+// It exists because zu2's adapter had one and this one did not, which
+// meant the two engines were not being compared on the same terms. zu2
+// reused its maps and its buffers because it was the engine under test
+// and somebody profiled it (tamnd/zu#678 put makemap at 16.4 percent of a
+// thirty two thread run), and lmdb allocated a map per row and formatted
+// its key with fmt.Sprintf per operation because nobody ever looked. On
+// a fifty row workload e scan that is fifty makemaps an operation on one
+// side and none on the other, on the workload that decides the claim.
+//
+// Nothing here is a trick. It is the same four things zu2 already does:
+// a scratch key, a scratch row, a map reused across reads, and one map
+// per row position reused across scans. tamnd/zu#726.
+type lmdbState struct {
+	// table:key scratch, so building a row key costs no allocation.
+	key []byte
+	// table: scratch for the scan bound, which is invariant for the whole
+	// run and used to be formatted once per scan.
+	prefix []byte
+	// Encode scratch for Insert and Update.
+	buf []byte
+
+	// A point read copies the record out of the map before the read
+	// transaction ends, because the decode sub-slices rather than copying
+	// and the snapshot goes away (a1f84f2). This is where it copies to,
+	// once per thread rather than once per read, and vals is the map it
+	// decodes into.
+	row  []byte
+	vals map[string][]byte
+	// The map Update decodes the existing row into. Its own rather than
+	// vals, because an Update is allowed to happen between a Read and the
+	// caller looking at what the Read returned.
+	updVals map[string][]byte
+
+	// A scan copies every row it is going to return into one buffer and
+	// records where each started, then decodes afterwards. The two passes
+	// are not stylistic: appending can move the buffer, so a row decoded
+	// during the walk would be left pointing at the old array as soon as a
+	// later row grew it. Offsets survive that, pointers do not.
+	scanBuf  []byte
+	scanOff  []int
+	scanVals []map[string][]byte
+	scanRows []map[string][]byte
+}
+
+func (s *lmdbState) rowKey(table, key string) []byte {
+	s.key = append(s.key[:0], table...)
+	s.key = append(s.key, ':')
+	s.key = append(s.key, key...)
+	return s.key
+}
+
+func (s *lmdbState) tablePrefix(table string) []byte {
+	s.prefix = append(s.prefix[:0], table...)
+	s.prefix = append(s.prefix, ':')
+	return s.prefix
+}
+
+func newState() *lmdbState {
+	return &lmdbState{
+		vals:    make(map[string][]byte, 16),
+		updVals: make(map[string][]byte, 16),
+	}
+}
+
+// state returns the calling thread's scratch. The fallback is for callers
+// that reach an operation without having gone through InitThread, which
+// the harness does not do but the interface does not forbid, and taking
+// the allocation there is better than writing through a shared one.
+func (db *lmdbDB) state(ctx context.Context) *lmdbState {
+	if s, ok := ctx.Value(ctxKey{}).(*lmdbState); ok {
+		return s
+	}
+	return newState()
 }
 
 func (c lmdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
@@ -135,10 +213,9 @@ func (c lmdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 
 	db := &lmdbDB{
-		p:       p,
-		env:     env,
-		r:       util.NewRowCodec(p),
-		bufPool: util.NewBufPool(),
+		p:   p,
+		env: env,
+		r:   util.NewRowCodec(p),
 	}
 
 	// One unnamed database for everything, with the table name in the key
@@ -167,65 +244,80 @@ func (db *lmdbDB) Close() error {
 }
 
 func (db *lmdbDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
-	return ctx
+	return context.WithValue(ctx, ctxKey{}, newState())
 }
 
 func (db *lmdbDB) CleanupThread(_ context.Context) {}
 
-func (db *lmdbDB) rowKey(table string, key string) []byte {
-	return util.Slice(fmt.Sprintf("%s:%s", table, key))
-}
-
+// Read takes the record out of the map inside the read transaction and
+// decodes it after.
+//
+// RawRead is on, and the copy on the line below it is what makes that
+// legal. The pair has to stay together: RawRead hands back a slice into
+// the snapshot, the decode sub-slices rather than copying (decodeBytes
+// ends `return remain[n:], remain[:n], nil`), so without a copy of its
+// own the map handed to the caller points into a snapshot that has been
+// aborted. That was a1f84f2, and it reproduces: workload a with
+// dataintegrity=true, fieldcount=1 and fieldlength=8000 at 50000 records
+// and 32 threads puts values on overflow pages, which a write frees
+// whole and the next write takes straight back, and four runs out of
+// four came back with a complete record belonging to a different key.
+//
+// a1f84f2 fixed it by dropping RawRead and letting lmdb-go take the
+// copy, which costs an allocation a read. This takes the copy into a
+// buffer the thread already owns instead, so it is a memcpy and nothing
+// else, which is what zu2's adapter has always done.
+//
+// The map and the buffer both belong to the thread and both last until
+// its next Read. That is the same contract zu2's Read gives, and it is
+// safe against the read modify write path for the same reason: Update
+// touches neither of them.
 func (db *lmdbDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
-	var m map[string][]byte
+	s := db.state(ctx)
+	found := false
 	err := db.env.View(func(txn *lmdb.Txn) error {
-		// This used to set RawRead, on the reasoning that the decode
-		// happens inside the transaction and "the decode copies what it
-		// keeps". It does not. `DecodeInto` goes through `EachColumn` to
-		// `decodeBytes`, which ends `return remain[n:], remain[:n], nil`,
-		// so every value in the map returned here was a slice into the
-		// read snapshot, and the snapshot is gone by the time the caller
-		// looks at it. Under b and c nothing writes and no page is ever
-		// recycled, so it always worked. Under a, e and f a writer takes
-		// those pages back and the read quietly returns the wrong bytes.
-		//
-		// Leaving RawRead off makes lmdb-go copy the record out of the map
-		// before handing it over, which is a copy and an allocation a read
-		// that this adapter did not used to pay. It is what correctness
-		// costs. tamnd/zu#726 puts the copy into a buffer the thread owns
-		// instead, which gets most of it back without the bug.
-		//
-		// This is not a theoretical lifetime argument, it reproduces. Load
-		// and run workload a with dataintegrity=true, fieldcount=1 and
-		// fieldlength=8000 at 50000 records and 32 threads: eight kilobyte
-		// values go on overflow pages, which a write frees whole and the
-		// next write takes straight back, so the window is wide enough to
-		// hit. Four runs out of four failed with RawRead on and four out
-		// of four passed with it off. The failure is not a garbled record,
-		// it is a whole clean record belonging to a different key, which
-		// is what reading a recycled page looks like.
-		v, err := txn.Get(db.dbi, db.rowKey(table, key))
+		txn.RawRead = true
+		v, err := txn.Get(db.dbi, s.rowKey(table, key))
 		if lmdb.IsNotFound(err) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		m, err = db.r.Decode(v, fields)
-		return err
+		s.row = append(s.row[:0], v...)
+		found = true
+		return nil
 	})
-	return m, err
+	if err != nil || !found {
+		return nil, err
+	}
+	return db.r.DecodeInto(s.row, fields, s.vals)
 }
 
+// Scan copies every row it will return into one thread owned buffer
+// inside the read transaction, then decodes them all after it.
+//
+// The two passes are not tidiness. Appending can move the buffer, so a
+// row decoded during the walk would be left pointing into the old array
+// the moment a later row grew it, which is the same class of bug as
+// a1f84f2 only self inflicted. Offsets survive a move, pointers do not,
+// so the walk records where each row started and the decode resolves
+// those offsets once the buffer has stopped growing.
+//
+// The maps are one per row position and are reused across scans, because
+// the caller gets all fifty rows of a workload e scan at once and they
+// have to be live together. That is fifty makemaps an operation this
+// adapter used to do and zu2's never did.
 func (db *lmdbDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	res := make([]map[string][]byte, 0, count)
-	prefix := fmt.Sprintf("%s:", table)
+	s := db.state(ctx)
+	// The prefix is invariant for the whole run and used to be formatted
+	// once per scan.
+	prefix := s.tablePrefix(table)
+	s.scanBuf = s.scanBuf[:0]
+	s.scanOff = s.scanOff[:0]
+
 	err := db.env.View(func(txn *lmdb.Txn) error {
-		// No RawRead here either, and for the same reason as Read: the
-		// decoded values are slices into the record, so with RawRead on
-		// they are slices into the snapshot and they outlive it. A scan
-		// returns fifty of them at once, so this one was fifty dangling
-		// rows an operation rather than one.
+		txn.RawRead = true
 		cur, err := txn.OpenCursor(db.dbi)
 		if err != nil {
 			return err
@@ -233,7 +325,7 @@ func (db *lmdbDB) Scan(ctx context.Context, table string, startKey string, count
 		defer cur.Close()
 
 		op := uint(lmdb.SetRange)
-		for k, v, err := cur.Get(db.rowKey(table, startKey), nil, op); ; k, v, err = cur.Get(nil, nil, lmdb.Next) {
+		for k, v, err := cur.Get(s.rowKey(table, startKey), nil, op); ; k, v, err = cur.Get(nil, nil, lmdb.Next) {
 			if lmdb.IsNotFound(err) {
 				return nil
 			}
@@ -243,15 +335,12 @@ func (db *lmdbDB) Scan(ctx context.Context, table string, startKey string, count
 			// The keyspace is one tree shared by every table, so the walk
 			// has to stop at the end of this table's prefix rather than
 			// carrying on into the next one's rows.
-			if len(k) < len(prefix) || string(k[:len(prefix)]) != prefix {
+			if !bytes.HasPrefix(k, prefix) {
 				return nil
 			}
-			m, err := db.r.Decode(v, fields)
-			if err != nil {
-				return err
-			}
-			res = append(res, m)
-			if len(res) >= count {
+			s.scanOff = append(s.scanOff, len(s.scanBuf))
+			s.scanBuf = append(s.scanBuf, v...)
+			if len(s.scanOff) >= count {
 				return nil
 			}
 		}
@@ -259,11 +348,30 @@ func (db *lmdbDB) Scan(ctx context.Context, table string, startKey string, count
 	if err != nil {
 		return nil, err
 	}
+
+	n := len(s.scanOff)
+	for len(s.scanVals) < n {
+		s.scanVals = append(s.scanVals, make(map[string][]byte, 16))
+	}
+	res := s.scanRows[:0]
+	for i := 0; i < n; i++ {
+		end := len(s.scanBuf)
+		if i+1 < n {
+			end = s.scanOff[i+1]
+		}
+		m, err := db.r.DecodeInto(s.scanBuf[s.scanOff[i]:end], fields, s.scanVals[i])
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, m)
+	}
+	s.scanRows = res
 	return res, nil
 }
 
 func (db *lmdbDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
-	rowKey := db.rowKey(table, key)
+	s := db.state(ctx)
+	rowKey := s.rowKey(table, key)
 
 	// Read, merge and write inside one write transaction. LMDB takes a
 	// single writer lock for the whole transaction, so this is a read
@@ -279,13 +387,14 @@ func (db *lmdbDB) Update(ctx context.Context, table string, key string, values m
 		// Scan hand their maps to the caller, which is what made the same
 		// flag a bug there. tamnd/zu#726.
 		txn.RawRead = true
-		data := make(map[string][]byte, len(values))
+		data := s.updVals
+		clear(data)
 		v, err := txn.Get(db.dbi, rowKey)
 		if err != nil && !lmdb.IsNotFound(err) {
 			return err
 		}
 		if err == nil {
-			if data, err = db.r.Decode(v, nil); err != nil {
+			if data, err = db.r.DecodeInto(v, nil, data); err != nil {
 				return err
 			}
 		}
@@ -293,32 +402,35 @@ func (db *lmdbDB) Update(ctx context.Context, table string, key string, values m
 			data[field] = value
 		}
 
-		buf := db.bufPool.Get()
-		defer func() { db.bufPool.Put(buf) }()
-		buf, err = db.r.Encode(buf, data)
+		s.buf, err = db.r.Encode(s.buf[:0], data)
 		if err != nil {
 			return err
 		}
-		return txn.Put(db.dbi, rowKey, buf, 0)
+		return txn.Put(db.dbi, rowKey, s.buf, 0)
 	})
 }
 
 func (db *lmdbDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	buf := db.bufPool.Get()
-	defer func() { db.bufPool.Put(buf) }()
+	s := db.state(ctx)
 
-	buf, err := db.r.Encode(buf, values)
+	buf, err := db.r.Encode(s.buf[:0], values)
 	if err != nil {
 		return err
 	}
-	rowKey := db.rowKey(table, key)
+	s.buf = buf
+	// Encoded before the key is built, because both live in this thread's
+	// scratch and rowKey writes a different field. mdb_put copies the
+	// value into the map before it returns, so the buffer is free again as
+	// soon as the transaction does, which is not true of badger or bolt
+	// (00d9f3e, 8b96620).
+	rowKey := s.rowKey(table, key)
 	return db.env.Update(func(txn *lmdb.Txn) error {
 		return txn.Put(db.dbi, rowKey, buf, 0)
 	})
 }
 
 func (db *lmdbDB) Delete(ctx context.Context, table string, key string) error {
-	rowKey := db.rowKey(table, key)
+	rowKey := db.state(ctx).rowKey(table, key)
 	return db.env.Update(func(txn *lmdb.Txn) error {
 		err := txn.Del(db.dbi, rowKey, nil)
 		if lmdb.IsNotFound(err) {
