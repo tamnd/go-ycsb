@@ -16,15 +16,15 @@
 package rocksdb
 
 import (
+	"bytes"
 	"context"
-	"fmt"
 	"os"
 
+	gorocksdb "github.com/linxGnu/grocksdb"
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
-	"github.com/tecbot/gorocksdb"
 )
 
 // properties
@@ -70,14 +70,80 @@ type rocksDB struct {
 
 	db *gorocksdb.DB
 
-	r       *util.RowCodec
-	bufPool *util.BufPool
+	r *util.RowCodec
 
 	readOpts  *gorocksdb.ReadOptions
 	writeOpts *gorocksdb.WriteOptions
 }
 
-type contextKey string
+type ctxKey struct{}
+
+// state is the per thread scratch this adapter keeps, and it is the same
+// shape the lmdb, pebble and badger ones grew for tamnd/zu#726. zu2's
+// adapter reused its maps and its buffers because zu2 was the engine
+// under test and it was the one that got profiled, and every other
+// adapter allocated a map per row and built its row key with
+// fmt.Sprintf per operation. Comparing those two compares the adapters
+// as much as the engines.
+//
+// This adapter did not have the dangling read half of #726: it already
+// copied through cloneValue before decoding. What it had was an
+// allocation per copy, a map per row and a Sprintf per operation, plus
+// two scan bugs of its own noted on Scan.
+type rocksState struct {
+	// table:key scratch, and the table prefix an iterator has to stop at.
+	key    []byte
+	prefix []byte
+	// Encode scratch for Insert and Update.
+	buf []byte
+
+	// Read's copy of the record and the map it decodes into.
+	row  []byte
+	vals map[string][]byte
+	// Update's own, kept separate from Read's for the reason the pebble
+	// adapter gives: the read modify write path calls Read, then Update
+	// on the same key, then verifies what the Read returned, so an
+	// Update writing through the buffer Read's map points into corrupts
+	// a row still being looked at.
+	updRow  []byte
+	updVals map[string][]byte
+
+	// A scan copies every row into one buffer and records where each
+	// started, then decodes after the buffer has stopped growing.
+	// Appending can move the buffer, so a row decoded during the walk
+	// points into the old array as soon as a later row grows it.
+	scanBuf  []byte
+	scanOff  []int
+	scanVals []map[string][]byte
+	scanRows []map[string][]byte
+}
+
+func (s *rocksState) rowKey(table, key string) []byte {
+	s.key = append(s.key[:0], table...)
+	s.key = append(s.key, ':')
+	s.key = append(s.key, key...)
+	return s.key
+}
+
+func (s *rocksState) tablePrefix(table string) []byte {
+	s.prefix = append(s.prefix[:0], table...)
+	s.prefix = append(s.prefix, ':')
+	return s.prefix
+}
+
+func newState() *rocksState {
+	return &rocksState{
+		vals:    make(map[string][]byte, 16),
+		updVals: make(map[string][]byte, 16),
+	}
+}
+
+func (db *rocksDB) state(ctx context.Context) *rocksState {
+	if s, ok := ctx.Value(ctxKey{}).(*rocksState); ok {
+		return s
+	}
+	return newState()
+}
 
 func (c rocksDBCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	dir := p.GetString(rocksdbDir, "/tmp/rocksdb")
@@ -97,7 +163,6 @@ func (c rocksDBCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		p:         p,
 		db:        db,
 		r:         util.NewRowCodec(p),
-		bufPool:   util.NewBufPool(),
 		readOpts:  gorocksdb.NewDefaultReadOptions(),
 		writeOpts: gorocksdb.NewDefaultWriteOptions(),
 	}, nil
@@ -168,96 +233,154 @@ func (db *rocksDB) Close() error {
 }
 
 func (db *rocksDB) InitThread(ctx context.Context, _ int, _ int) context.Context {
-	return ctx
+	return context.WithValue(ctx, ctxKey{}, newState())
 }
 
 func (db *rocksDB) CleanupThread(_ context.Context) {
 }
 
-func (db *rocksDB) getRowKey(table string, key string) []byte {
-	return util.Slice(fmt.Sprintf("%s:%s", table, key))
-}
-
-func cloneValue(v *gorocksdb.Slice) []byte {
-	return append([]byte(nil), v.Data()...)
-}
-
+// Read copies the record into a buffer the thread owns and decodes that.
+//
+// The copy is not new, this adapter already had one. What is new is
+// where it goes: it used to be append([]byte(nil), ...) per read, which
+// is an allocation and a garbage collection for every operation in the
+// run, and it is now a memcpy into scratch. The copy itself is still
+// required, because Free hands the block back to RocksDB and the decode
+// sub-slices rather than copying.
 func (db *rocksDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
-	value, err := db.db.Get(db.readOpts, db.getRowKey(table, key))
+	s := db.state(ctx)
+	value, err := db.db.Get(db.readOpts, s.rowKey(table, key))
 	if err != nil {
 		return nil, err
 	}
-	defer value.Free()
+	if value.Data() == nil {
+		value.Free()
+		return nil, nil
+	}
+	s.row = append(s.row[:0], value.Data()...)
+	value.Free()
 
-	return db.r.Decode(cloneValue(value), fields)
+	return db.r.DecodeInto(s.row, fields, s.vals)
 }
 
+// Scan walks from the start key, copying every row it will return into
+// one thread owned buffer, and decodes them after the walk.
+//
+// Three things were wrong here and only one of them is the #726 pattern.
+//
+// The iterator had no upper bound and no prefix check, so it walked
+// straight out of the table it was given and into whatever is stored
+// after it. A scan near the last key of a table returned rows belonging
+// to another one, which the scan integrity check reads as keys that do
+// not climb.
+//
+// The result slice was sized to count and written by index, so a scan
+// that found ten rows returned ten rows and forty nil maps, and nothing
+// downstream can tell a row that was not there from a row that was
+// empty. Appended instead.
+//
+// And it decoded each row as it walked, out of a fresh allocation per
+// row. The allocation is what the offsets replace. Decoding during the
+// walk would be wrong here even with the copies, because appending can
+// move the buffer.
 func (db *rocksDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	res := make([]map[string][]byte, count)
+	s := db.state(ctx)
 	it := db.db.NewIterator(db.readOpts)
 	defer it.Close()
 
-	rowStartKey := db.getRowKey(table, startKey)
-
-	it.Seek(rowStartKey)
-	i := 0
-	for it = it; it.Valid() && i < count; it.Next() {
-		value := it.Value()
-		m, err := db.r.Decode(cloneValue(value), fields)
-		if err != nil {
-			return nil, err
+	prefix := s.tablePrefix(table)
+	s.scanBuf = s.scanBuf[:0]
+	s.scanOff = s.scanOff[:0]
+	for it.Seek(s.rowKey(table, startKey)); it.Valid() && len(s.scanOff) < count; it.Next() {
+		k := it.Key()
+		inTable := bytes.HasPrefix(k.Data(), prefix)
+		k.Free()
+		if !inTable {
+			break
 		}
-		res[i] = m
-		i++
+		v := it.Value()
+		s.scanOff = append(s.scanOff, len(s.scanBuf))
+		s.scanBuf = append(s.scanBuf, v.Data()...)
+		v.Free()
 	}
 
 	if err := it.Err(); err != nil {
 		return nil, err
 	}
 
+	n := len(s.scanOff)
+	for len(s.scanVals) < n {
+		s.scanVals = append(s.scanVals, make(map[string][]byte, 16))
+	}
+	res := s.scanRows[:0]
+	for i := 0; i < n; i++ {
+		end := len(s.scanBuf)
+		if i+1 < n {
+			end = s.scanOff[i+1]
+		}
+		m, err := db.r.DecodeInto(s.scanBuf[s.scanOff[i]:end], fields, s.scanVals[i])
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, m)
+	}
+	s.scanRows = res
 	return res, nil
 }
 
 func (db *rocksDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
-	m, err := db.Read(ctx, table, key, nil)
+	s := db.state(ctx)
+	rowKey := s.rowKey(table, key)
+
+	// The read half is inline rather than a call to db.Read, because
+	// Read decodes into this thread's read map and the read modify write
+	// path is still holding the map its own Read returned.
+	value, err := db.db.Get(db.readOpts, rowKey)
 	if err != nil {
 		return err
 	}
-
-	for field, value := range values {
-		m[field] = value
+	data := s.updVals
+	clear(data)
+	if value.Data() != nil {
+		s.updRow = append(s.updRow[:0], value.Data()...)
+		value.Free()
+		if data, err = db.r.DecodeInto(s.updRow, nil, data); err != nil {
+			return err
+		}
+	} else {
+		value.Free()
 	}
 
-	buf := db.bufPool.Get()
-	defer db.bufPool.Put(buf)
+	for field, v := range values {
+		data[field] = v
+	}
 
-	buf, err = db.r.Encode(buf, m)
+	s.buf, err = db.r.Encode(s.buf[:0], data)
 	if err != nil {
 		return err
 	}
-
-	rowKey := db.getRowKey(table, key)
-
-	return db.db.Put(db.writeOpts, rowKey, buf)
+	// rowKey is still good here: everything between it and this line
+	// wrote updRow, updVals or buf, and none of those is the key buffer.
+	return db.db.Put(db.writeOpts, rowKey, s.buf)
 }
 
 func (db *rocksDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	rowKey := db.getRowKey(table, key)
+	s := db.state(ctx)
 
-	buf := db.bufPool.Get()
-	defer db.bufPool.Put(buf)
-
-	buf, err := db.r.Encode(buf, values)
+	buf, err := db.r.Encode(s.buf[:0], values)
 	if err != nil {
 		return err
 	}
-	return db.db.Put(db.writeOpts, rowKey, buf)
+	s.buf = buf
+	// Encoded before the key is built, because both live in this thread's
+	// scratch. Put copies the value into the memtable before it returns,
+	// as lmdb and pebble do and as badger and bolt do not, so the buffer
+	// is free again straight after (00d9f3e, 8b96620).
+	return db.db.Put(db.writeOpts, s.rowKey(table, key), buf)
 }
 
 func (db *rocksDB) Delete(ctx context.Context, table string, key string) error {
-	rowKey := db.getRowKey(table, key)
-
-	return db.db.Delete(db.writeOpts, rowKey)
+	return db.db.Delete(db.writeOpts, db.state(ctx).rowKey(table, key))
 }
 
 func init() {
