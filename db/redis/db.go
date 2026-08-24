@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	goredis "github.com/go-redis/redis/v9"
+	goredis "github.com/redis/go-redis/v9"
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
@@ -403,4 +403,10 @@ func getOptionsCluster(p *properties.Properties) *goredis.ClusterOptions {
 
 func init() {
 	ycsb.RegisterDBCreator("redis", redisCreator{})
+	// Valkey is the fork the Linux Foundation took on when Redis changed
+	// its licence in 2024, and it speaks the same wire protocol, so the
+	// same adapter drives it. The alias is here rather than in the
+	// harness so that a run says which of the two it measured, the same
+	// way pg registers cockroach beside itself.
+	ycsb.RegisterDBCreator("valkey", redisCreator{})
 }

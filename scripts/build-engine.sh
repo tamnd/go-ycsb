@@ -24,7 +24,7 @@ mkdir -p "$WORK"
 
 ENGINES=("$@")
 if [ "${1:-}" = "all" ] || [ $# -eq 0 ]; then
-  ENGINES=(sqlite duckdb ladybug neo4j pg zu zu2)
+  ENGINES=(sqlite duckdb ladybug neo4j pg redis valkey pebble zu zu2)
 fi
 
 for e in "${ENGINES[@]}"; do
@@ -33,7 +33,11 @@ for e in "${ENGINES[@]}"; do
     # pg and mongodb came with go-ycsb and have no tag, they are always
     # compiled in. They still get their own binary so nothing else is
     # linked alongside.
-    pg|mongodb) tag="" ;;
+    # redis and valkey are the same story as pg: no tag, always compiled
+    # in, and they still get a binary each so nothing else is linked
+    # beside them. valkey is the redis adapter under another name, so the
+    # tag would be redis either way.
+    pg|mongodb|redis|valkey) tag="" ;;
   esac
 
   # Extra link flags, per engine and per platform.

@@ -19,6 +19,11 @@ BOLT_PORT="${BOLT_PORT:-7687}"
 # 57017 rather than 27017 for the reason pg is on 55432: a host that
 # already runs MongoDB for something else should not have to stop it.
 MONGO_PORT="${MONGO_PORT:-57017}"
+# Same reasoning again for the two in memory engines, and they get a port
+# each so both can be up together and neither is measured on the other's
+# data.
+REDIS_PORT="${REDIS_PORT:-56379}"
+VALKEY_PORT="${VALKEY_PORT:-56380}"
 
 # Sized against a 32 GB host. Both get enough that the whole working set
 # is resident, because a benchmark that pages is measuring the disk.
@@ -28,7 +33,7 @@ SHARED_BUFFERS="${PG_SHARED_BUFFERS:-8GB}"
 WT_CACHE="${MONGO_WT_CACHE:-8}"
 
 up() {
-  docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb >/dev/null 2>&1
+  docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb >/dev/null 2>&1
 
   docker run -d --name neo4j-ycsb --restart unless-stopped \
     -p "$BOLT_PORT":7687 -p 7474:7474 \
@@ -65,6 +70,25 @@ up() {
   docker run -d --name mongo-ycsb --restart unless-stopped \
     -p "$MONGO_PORT":27017 \
     mongo:latest --wiredTigerCacheSizeGB "$WT_CACHE" >/dev/null
+
+  # Redis and its fork, both with persistence off, which is the same
+  # bargain the others are held to and in Redis's case the one it is
+  # usually run under. save "" turns off the periodic RDB snapshot and
+  # appendonly no turns off the log, so nothing here waits for a device
+  # and none of these numbers is a durability claim either.
+  #
+  # No maxmemory. An eviction policy that starts dropping keys partway
+  # through a load would be measured as a fast load of a database that is
+  # missing records, and the row count check would catch it, but the
+  # right answer is not to arm it in the first place.
+  docker run -d --name redis-ycsb --restart unless-stopped \
+    -p "$REDIS_PORT":6379 \
+    redis:latest redis-server --save "" --appendonly no >/dev/null
+
+  docker run -d --name valkey-ycsb --restart unless-stopped \
+    -p "$VALKEY_PORT":6379 \
+    valkey/valkey:latest valkey-server --save "" --appendonly no >/dev/null
+
 }
 
 # restart unless-stopped only helps once the docker daemon is back. On
@@ -81,14 +105,14 @@ up() {
 # that is restarting is rebuilt from nothing instead of waited on.
 start_existing() {
   local name
-  for name in neo4j-ycsb pg-ycsb mongo-ycsb; do
+  for name in neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb; do
     case "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" in
       # Nothing there at all, which is a first run on this host.
       "")           echo "building both, $name is not there"; up; return ;;
       restarting)   echo "rebuilding both, $name is crash looping"; up; return ;;
     esac
   done
-  docker start neo4j-ycsb pg-ycsb mongo-ycsb >/dev/null 2>&1
+  docker start neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb >/dev/null 2>&1
 }
 
 wait_ready() {
@@ -96,11 +120,15 @@ wait_ready() {
   for i in $(seq 1 120); do
     if docker exec pg-ycsb pg_isready -q -U postgres >/dev/null 2>&1 &&
        docker exec mongo-ycsb mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 &&
+       docker exec redis-ycsb redis-cli ping >/dev/null 2>&1 &&
+       docker exec valkey-ycsb valkey-cli ping >/dev/null 2>&1 &&
        docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
          'RETURN 1' >/dev/null 2>&1; then
       echo "servers ready after ${i}s"
       docker exec pg-ycsb psql -U postgres -tAc 'select version()'
       docker exec mongo-ycsb mongosh --quiet --eval 'db.version()'
+      docker exec redis-ycsb redis-cli info server | sed -n 's/^redis_version:/redis /p'
+      docker exec valkey-ycsb valkey-cli info server | sed -n 's/^valkey_version:/valkey /p'
       docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
         'call dbms.components() yield name, versions return name, versions' | tail -3
       return 0
@@ -115,6 +143,6 @@ wait_ready() {
 case "${1:-up}" in
   up)   up; wait_ready ;;
   wait) start_existing; wait_ready ;;
-  down) docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb ;;
+  down) docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb ;;
   *)    echo "usage: $0 [up|down|wait]" >&2; exit 2 ;;
 esac

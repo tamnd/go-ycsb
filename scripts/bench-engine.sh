@@ -99,6 +99,35 @@ case "$ENGINE" in
     # synchronous_commit=off.
     ENGINE_ARGS=(-p mongodb.url="${MONGO_URL:-mongodb://127.0.0.1:57017/ycsb?w=1}")
     ;;
+  redis|valkey)
+    # Two engines out of one adapter. Valkey is the fork the Linux
+    # Foundation took on when Redis changed its licence, it speaks the
+    # same wire protocol, and go-redis talks to it without knowing the
+    # difference, so the only thing that separates them here is which
+    # port the client dials. They get separate ports and separate
+    # containers so both can be up at once and neither is measured on
+    # the other's data.
+    #
+    # datatype=hash rather than the adapter's default of string. On
+    # string the whole record is one JSON document, so a read is a GET
+    # plus a JSON unmarshal on the client and an update is a read,
+    # modify and write. On hash the record is a Redis hash and a read is
+    # one HMGET, which is the shape YCSB has meant by a Redis record
+    # since the original Java harness. String came out a little ahead in
+    # a first pass over a Docker bridge on macOS, which is a measurement
+    # of the bridge, so this is being taken again on the Linux hosts and
+    # both modes go in the table the way sqlite's modes do.
+    ENGINE_ARGS=(-p redis.addr="${REDIS_ADDR:-127.0.0.1:$([ "$ENGINE" = valkey ] && echo 56380 || echo 56379)}"
+                 -p redis.datatype="${REDIS_DATATYPE:-hash}")
+    ;;
+  pebble)
+    # Everything else takes the adapter's defaults, which are Pebble's
+    # own except for the block cache. Eight MiB is the library default
+    # and is a read off the device for nearly every miss at any record
+    # count worth measuring, so the adapter raises it, the same way the
+    # sqlite adapter raises the page cache and for the same reason.
+    ENGINE_ARGS=(-p "pebble.dir=$DATA.pebble")
+    ;;
   ladybug)
     ENGINE_ARGS=(-p "ladybug.dbpath=$DATA.lbug")
     ;;
@@ -131,6 +160,7 @@ reset_data() {
     ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
                    "$DATA.lbug.checkpoint.apply.lock" \
                    "$DATA.lbug.checkpoint.intent.lock" ;;
+    pebble)  rm -rf "$DATA.pebble" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # A zu2 database is a log and three sidecars beside it, and removing
     # the log alone leaves the previous workload's checkpoint and cold
@@ -140,7 +170,7 @@ reset_data() {
     # would be charged to the workload that did not write it.
     zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
                    "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
-    pg|neo4j|mongodb) : ;;  # nothing on this side, see LOAD_ARGS below
+    pg|neo4j|mongodb|redis|valkey) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
   # The reset knows one path per engine and the engines keep more than
   # one, which is how ladybug ran a whole sweep beside an orphaned write
@@ -162,7 +192,7 @@ reset_data() {
 # the first and every insert after A would be a duplicate key.
 LOAD_ARGS=()
 case "$ENGINE" in
-  pg|neo4j|mongodb) LOAD_ARGS=(-p dropdata=true) ;;
+  pg|neo4j|mongodb|redis|valkey) LOAD_ARGS=(-p dropdata=true) ;;
 esac
 
 field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
@@ -266,6 +296,25 @@ storage() {  # storage <workload> <phase> <output>
   return 0
 }
 
+# One way to reach whichever of the two servers this run is measuring.
+# redis-cli on the host if there is one, and the container's own
+# otherwise, which is the same fallback the mongodb row count uses and
+# for the same reason: the benchmark hosts have psql and sqlite3 and none
+# of them has redis-cli. Either way this is the server being asked rather
+# than the client being believed.
+redis_cli() {
+  local port container
+  case "$ENGINE" in
+    valkey) port=56380; container=valkey-ycsb ;;
+    *)      port=56379; container=redis-ycsb ;;
+  esac
+  if command -v redis-cli >/dev/null 2>&1; then
+    redis-cli -h 127.0.0.1 -p "$port" "$@"
+  else
+    docker exec "$container" redis-cli "$@"
+  fi
+}
+
 # The same question asked of every engine by the filesystem rather than
 # by the engine. du counts blocks, so a file with holes punched in it by
 # a compaction is counted at what it really costs and a file with a free
@@ -289,6 +338,31 @@ space() {  # space <workload> <phase>
   #
   # None of them is directly comparable to sqlite's file to the byte, and
   # all three are the closest thing that engine has to one.
+  # Redis and Valkey keep the whole dataset in memory and are configured
+  # here with persistence off, so there is nothing on the device to
+  # measure and du would report a zero that reads like a failed load.
+  # What they have instead is used_memory, which is the allocator's
+  # account of the dataset, and used_memory_rss, which is what the kernel
+  # has given the server. Both go in, because the gap between them is
+  # fragmentation and an in memory engine compared on the smaller of the
+  # two is being flattered.
+  case "$ENGINE" in
+    redis|valkey)
+      local ru rr
+      ru=$(redis_cli info memory 2>/dev/null | sed -n 's/^used_memory:\([0-9]*\).*/\1/p' | tr -d '[:space:]')
+      rr=$(redis_cli info memory 2>/dev/null | sed -n 's/^used_memory_rss:\([0-9]*\).*/\1/p' | tr -d '[:space:]')
+      if [[ "$ru" =~ ^[0-9]+$ ]] && [ "$ru" -gt 0 ]; then
+        awk -v w="$1" -v p="$2" -v e="$ENGINE" -v b="$ru" -v n="$RECORDS" \
+          'BEGIN { printf "# %s %s: %s in memory %.1f MiB, %.0f bytes a record (dataset, nothing on the device)\n", w, p, e, b / 1048576, b / n }' \
+          | tee -a "$OUT"
+        [[ "$rr" =~ ^[0-9]+$ ]] && awk -v w="$1" -v p="$2" -v e="$ENGINE" -v b="$rr" \
+          'BEGIN { printf "# %s %s: %s server rss %.1f MiB\n", w, p, e, b / 1048576 }' | tee -a "$OUT"
+      else
+        echo "# $1 $2: $ENGINE would not say how much memory it is using" | tee -a "$OUT"
+      fi
+      return 0 ;;
+  esac
+
   case "$ENGINE" in
     pg|mongodb|neo4j)
       # Each one is asked to get what it is holding onto out to the device
@@ -348,7 +422,7 @@ space() {  # space <workload> <phase>
   # on gamingpc for workload b and the log said nothing.
   if [ "${kb:-0}" -le 0 ]; then
     case "$ENGINE" in
-      sqlite|duckdb|ladybug|zu|zu2)
+      sqlite|duckdb|ladybug|pebble|zu|zu2)
         echo "# $1 $2: WRONG, $ENGINE left nothing at $DATA.*" | tee -a "$OUT"
         ;;
     esac
@@ -387,14 +461,14 @@ space() {  # space <workload> <phase>
 # column beside four embedded engines is worse than a blank.
 timed() {  # timed <argv...>
   case "$ENGINE" in
-    pg|neo4j|mongodb) "$@" ;;
+    pg|neo4j|mongodb|redis|valkey) "$@" ;;
     *) if [ -n "$TIME_BIN" ]; then "$TIME_BIN" -v "$@"; else "$@"; fi ;;
   esac
 }
 
 maxrss() {  # maxrss <workload> <phase> <output>
   case "$ENGINE" in
-    pg|neo4j|mongodb)
+    pg|neo4j|mongodb|redis|valkey)
       echo "# $1 $2: $ENGINE keeps its data in a server process, no memory figure from this side" \
         | tee -a "$OUT"
       return 0
@@ -469,6 +543,11 @@ rows() {  # rows <workload> <phase> [output]
               -u "${NEO4J_USER:-neo4j}" -p "${NEO4J_PASSWORD:-benchpass}" \
               --format plain 'match (r:usertable) return count(r)' 2>/dev/null | tail -1)
       ;;
+    redis|valkey)
+      # DBSIZE is the number of keys in the database, and with one key a
+      # record and a flush before each load that is the record count.
+      redis_cli ping >/dev/null 2>&1 && have=yes && n=$(redis_cli dbsize 2>/dev/null)
+      ;;
     zu2)
       # No client on the host to ask, so the engine answers in its own
       # output and this reads it back out. The line is keys and not the
@@ -510,6 +589,16 @@ rows() {  # rows <workload> <phase> [output]
 # storage line then says what it costs where it is on and stays quiet
 # where it is not.
 SKIP=""
+# Except for Redis and Valkey, which have no ordered scan to skip with.
+# Redis keys live in a hash table and SCAN walks it in whatever order the
+# table happens to be in, so there is no answer to "the next fifty
+# records after this key" that is the same answer another engine would
+# give. The adapter says so rather than guessing, and workload E is left
+# out of their rows instead of being filled with an error or, worse, with
+# a fast number for a cheaper question.
+case "$ENGINE" in
+  redis|valkey) SKIP="e" ;;
+esac
 
 # One small self check before the sweep, because throughput is worth
 # nothing if the rows are not there. YCSB's own data integrity mode
