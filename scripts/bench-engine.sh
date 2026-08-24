@@ -91,6 +91,14 @@ case "$ENGINE" in
                  -p neo4j.username="${NEO4J_USER:-neo4j}"
                  -p neo4j.password="${NEO4J_PASSWORD:-benchpass}")
     ;;
+  mongodb)
+    # w=1 and no j, which is acknowledge on the primary and let the
+    # journal flush on its own interval. The journal cannot be turned
+    # off at all since 6.0, so this is as far as MongoDB goes, and it is
+    # the same bargain sqlite makes at synchronous=OFF and pg at
+    # synchronous_commit=off.
+    ENGINE_ARGS=(-p mongodb.url="${MONGO_URL:-mongodb://127.0.0.1:57017/ycsb?w=1}")
+    ;;
   ladybug)
     ENGINE_ARGS=(-p "ladybug.dbpath=$DATA.lbug")
     ;;
@@ -132,7 +140,7 @@ reset_data() {
     # would be charged to the workload that did not write it.
     zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
                    "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
-    pg|neo4j) : ;;  # nothing on this side, see LOAD_ARGS below
+    pg|neo4j|mongodb) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
   # The reset knows one path per engine and the engines keep more than
   # one, which is how ladybug ran a whole sweep beside an orphaned write
@@ -154,7 +162,7 @@ reset_data() {
 # the first and every insert after A would be a duplicate key.
 LOAD_ARGS=()
 case "$ENGINE" in
-  pg|neo4j) LOAD_ARGS=(-p dropdata=true) ;;
+  pg|neo4j|mongodb) LOAD_ARGS=(-p dropdata=true) ;;
 esac
 
 field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
@@ -312,14 +320,14 @@ space() {  # space <workload> <phase>
 # column beside four embedded engines is worse than a blank.
 timed() {  # timed <argv...>
   case "$ENGINE" in
-    pg|neo4j) "$@" ;;
+    pg|neo4j|mongodb) "$@" ;;
     *) if [ -n "$TIME_BIN" ]; then "$TIME_BIN" -v "$@"; else "$@"; fi ;;
   esac
 }
 
 maxrss() {  # maxrss <workload> <phase> <output>
   case "$ENGINE" in
-    pg|neo4j)
+    pg|neo4j|mongodb)
       echo "# $1 $2: $ENGINE keeps its data in a server process, no memory figure from this side" \
         | tee -a "$OUT"
       return 0
@@ -372,6 +380,21 @@ rows() {  # rows <workload> <phase> [output]
               -h "${PGHOST:-127.0.0.1}" -p "${PGPORT:-55432}" \
               -U "${PGUSER:-postgres}" -d "${PGDATABASE:-ycsb}" \
               -c 'select count(*) from usertable' 2>/dev/null)
+      ;;
+    mongodb)
+      # mongosh on the host if there is one, and the container's own
+      # otherwise, because the hosts that run these sweeps have psql and
+      # sqlite3 installed and none of them has mongosh. Either way this
+      # is the server being asked, not the client being believed.
+      if command -v mongosh >/dev/null 2>&1; then
+        have=yes
+        n=$(mongosh "${MONGO_URL:-mongodb://127.0.0.1:57017/ycsb}" --quiet \
+              --eval "db.getCollection('usertable').countDocuments({})" 2>/dev/null | tail -1)
+      elif docker exec mongo-ycsb mongosh --quiet --eval 'db.version()' >/dev/null 2>&1; then
+        have=yes
+        n=$(docker exec mongo-ycsb mongosh "mongodb://127.0.0.1:27017/ycsb" --quiet \
+              --eval "db.getCollection('usertable').countDocuments({})" 2>/dev/null | tail -1)
+      fi
       ;;
     neo4j)
       command -v cypher-shell >/dev/null 2>&1 && have=yes &&

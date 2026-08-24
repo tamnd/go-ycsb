@@ -18,7 +18,7 @@ THREADS="${2:-1}"
 shift 2 2>/dev/null || shift $#
 ENGINES=("$@")
 if [ ${#ENGINES[@]} -eq 0 ]; then
-  ENGINES=(sqlite duckdb ladybug pg neo4j)
+  ENGINES=(sqlite duckdb ladybug pg neo4j mongodb)
 fi
 
 WORK="${WORK:-$PWD/.bench}"
@@ -27,7 +27,7 @@ export WORK
 
 need_servers=0
 for e in "${ENGINES[@]}"; do
-  case "$e" in pg|neo4j) need_servers=1 ;; esac
+  case "$e" in pg|neo4j|mongodb) need_servers=1 ;; esac
 done
 
 if [ "$need_servers" = 1 ]; then

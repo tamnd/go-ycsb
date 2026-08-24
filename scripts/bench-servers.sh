@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Bring up the two engines that need a server, at the settings that make
-# each one as fast as it goes, and wait until both answer.
+# Bring up the engines that need a server, at the settings that make
+# each one as fast as it goes, and wait until they answer.
 #
 # usage: scripts/bench-servers.sh [up|down|wait]
 #
-# Both containers run on the host doing the measuring, so the hop is
-# loopback. Neo4j cannot be embedded at all and PostgreSQL is not embedded
-# here, so those two pay a protocol round trip the in process engines do
-# not. That is what running them costs and the numbers say so.
+# Every container runs on the host doing the measuring, so the hop is
+# loopback. Neo4j cannot be embedded at all, and PostgreSQL and MongoDB
+# are not embedded here, so those three pay a protocol round trip the in
+# process engines do not. That is what running them costs and the
+# numbers say so.
 
 set -uo pipefail
 
@@ -15,15 +16,19 @@ NEO4J_PASSWORD="${NEO4J_PASSWORD:-benchpass}"
 PGPASSWORD="${PGPASSWORD:-benchpass}"
 PGPORT="${PGPORT:-55432}"
 BOLT_PORT="${BOLT_PORT:-7687}"
+# 57017 rather than 27017 for the reason pg is on 55432: a host that
+# already runs MongoDB for something else should not have to stop it.
+MONGO_PORT="${MONGO_PORT:-57017}"
 
 # Sized against a 32 GB host. Both get enough that the whole working set
 # is resident, because a benchmark that pages is measuring the disk.
 HEAP="${NEO4J_HEAP:-8G}"
 PAGECACHE="${NEO4J_PAGECACHE:-8G}"
 SHARED_BUFFERS="${PG_SHARED_BUFFERS:-8GB}"
+WT_CACHE="${MONGO_WT_CACHE:-8}"
 
 up() {
-  docker rm -f neo4j-ycsb pg-ycsb >/dev/null 2>&1
+  docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb >/dev/null 2>&1
 
   docker run -d --name neo4j-ycsb --restart unless-stopped \
     -p "$BOLT_PORT":7687 -p 7474:7474 \
@@ -49,6 +54,17 @@ up() {
     -c checkpoint_timeout=30min \
     -c wal_level=minimal \
     -c max_wal_senders=0 >/dev/null
+
+  # The journal cannot be turned off any more, it has been mandatory
+  # since 6.0, so the bargain MongoDB is held to is the one it makes by
+  # default: acknowledge on the primary and let the journal flush on its
+  # own interval. That is w=1 j=false, which is what the connection
+  # string in bench-engine.sh asks for and is the same bargain as
+  # sqlite at synchronous=OFF and pg at synchronous_commit=off. The
+  # cache is sized so the working set is resident, like the other two.
+  docker run -d --name mongo-ycsb --restart unless-stopped \
+    -p "$MONGO_PORT":27017 \
+    mongo:latest --wiredTigerCacheSizeGB "$WT_CACHE" >/dev/null
 }
 
 # restart unless-stopped only helps once the docker daemon is back. On
@@ -65,24 +81,26 @@ up() {
 # that is restarting is rebuilt from nothing instead of waited on.
 start_existing() {
   local name
-  for name in neo4j-ycsb pg-ycsb; do
+  for name in neo4j-ycsb pg-ycsb mongo-ycsb; do
     case "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" in
       # Nothing there at all, which is a first run on this host.
       "")           echo "building both, $name is not there"; up; return ;;
       restarting)   echo "rebuilding both, $name is crash looping"; up; return ;;
     esac
   done
-  docker start neo4j-ycsb pg-ycsb >/dev/null 2>&1
+  docker start neo4j-ycsb pg-ycsb mongo-ycsb >/dev/null 2>&1
 }
 
 wait_ready() {
   local i
   for i in $(seq 1 120); do
     if docker exec pg-ycsb pg_isready -q -U postgres >/dev/null 2>&1 &&
+       docker exec mongo-ycsb mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 &&
        docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
          'RETURN 1' >/dev/null 2>&1; then
       echo "servers ready after ${i}s"
       docker exec pg-ycsb psql -U postgres -tAc 'select version()'
+      docker exec mongo-ycsb mongosh --quiet --eval 'db.version()'
       docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
         'call dbms.components() yield name, versions return name, versions' | tail -3
       return 0
@@ -97,6 +115,6 @@ wait_ready() {
 case "${1:-up}" in
   up)   up; wait_ready ;;
   wait) start_existing; wait_ready ;;
-  down) docker rm -f neo4j-ycsb pg-ycsb ;;
+  down) docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb ;;
   *)    echo "usage: $0 [up|down|wait]" >&2; exit 2 ;;
 esac

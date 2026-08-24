@@ -30,9 +30,10 @@ fi
 for e in "${ENGINES[@]}"; do
   tag="$e"
   case "$e" in
-    # pg came with go-ycsb and has no tag, it is always compiled in. It
-    # still gets its own binary so nothing else is linked alongside.
-    pg) tag="" ;;
+    # pg and mongodb came with go-ycsb and have no tag, they are always
+    # compiled in. They still get their own binary so nothing else is
+    # linked alongside.
+    pg|mongodb) tag="" ;;
   esac
 
   # Extra link flags, per engine and per platform.
