@@ -11,6 +11,7 @@ import (
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
+	"github.com/pingcap/go-ycsb/pkg/ycsb"
 )
 
 type histograms struct {
@@ -49,6 +50,31 @@ func (h *histograms) Measure(op string, start time.Time, lan time.Duration) {
 	}
 
 	opM.Measure(lan)
+}
+
+// merge folds another set of per operation histograms into this one.
+//
+// An hdr histogram merges exactly, so a percentile off the merged set
+// is the percentile of every sample the run took, the same number the
+// single locked histogram used to hold. The start time has to go back
+// to the earlier of the two, because the elapsed seconds and therefore
+// the OPS column are measured from it.
+func (h *histograms) merge(other ycsb.Measurer) {
+	o, ok := other.(*histograms)
+	if !ok {
+		return
+	}
+	for op, oM := range o.histograms {
+		opM, ok := h.histograms[op]
+		if !ok {
+			opM = newHistogram()
+			opM.startTime = oM.startTime
+			h.histograms[op] = opM
+		} else if oM.startTime.Before(opM.startTime) {
+			opM.startTime = oM.startTime
+		}
+		opM.hist.Merge(oM.hist)
+	}
 }
 
 func (h *histograms) summary() map[string][]string {
