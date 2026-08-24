@@ -179,12 +179,31 @@ func (db *lmdbDB) rowKey(table string, key string) []byte {
 func (db *lmdbDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
 	var m map[string][]byte
 	err := db.env.View(func(txn *lmdb.Txn) error {
-		// RawRead hands back the bytes in the map rather than a copy of
-		// them. They are only valid until the transaction ends, which is
-		// why the decode happens inside it, and the decode copies what it
-		// keeps. Without this every read allocates and copies the whole
-		// record before looking at a single field of it.
-		txn.RawRead = true
+		// This used to set RawRead, on the reasoning that the decode
+		// happens inside the transaction and "the decode copies what it
+		// keeps". It does not. `DecodeInto` goes through `EachColumn` to
+		// `decodeBytes`, which ends `return remain[n:], remain[:n], nil`,
+		// so every value in the map returned here was a slice into the
+		// read snapshot, and the snapshot is gone by the time the caller
+		// looks at it. Under b and c nothing writes and no page is ever
+		// recycled, so it always worked. Under a, e and f a writer takes
+		// those pages back and the read quietly returns the wrong bytes.
+		//
+		// Leaving RawRead off makes lmdb-go copy the record out of the map
+		// before handing it over, which is a copy and an allocation a read
+		// that this adapter did not used to pay. It is what correctness
+		// costs. tamnd/zu#726 puts the copy into a buffer the thread owns
+		// instead, which gets most of it back without the bug.
+		//
+		// This is not a theoretical lifetime argument, it reproduces. Load
+		// and run workload a with dataintegrity=true, fieldcount=1 and
+		// fieldlength=8000 at 50000 records and 32 threads: eight kilobyte
+		// values go on overflow pages, which a write frees whole and the
+		// next write takes straight back, so the window is wide enough to
+		// hit. Four runs out of four failed with RawRead on and four out
+		// of four passed with it off. The failure is not a garbled record,
+		// it is a whole clean record belonging to a different key, which
+		// is what reading a recycled page looks like.
 		v, err := txn.Get(db.dbi, db.rowKey(table, key))
 		if lmdb.IsNotFound(err) {
 			return nil
@@ -202,7 +221,11 @@ func (db *lmdbDB) Scan(ctx context.Context, table string, startKey string, count
 	res := make([]map[string][]byte, 0, count)
 	prefix := fmt.Sprintf("%s:", table)
 	err := db.env.View(func(txn *lmdb.Txn) error {
-		txn.RawRead = true
+		// No RawRead here either, and for the same reason as Read: the
+		// decoded values are slices into the record, so with RawRead on
+		// they are slices into the snapshot and they outlive it. A scan
+		// returns fifty of them at once, so this one was fifty dangling
+		// rows an operation rather than one.
 		cur, err := txn.OpenCursor(db.dbi)
 		if err != nil {
 			return err
@@ -249,6 +272,12 @@ func (db *lmdbDB) Update(ctx context.Context, table string, key string, values m
 	// single writer is the engine's design and not something to work
 	// around in the adapter.
 	return db.env.Update(func(txn *lmdb.Txn) error {
+		// RawRead is kept here and dropped in Read and Scan, and the
+		// difference is not an oversight. Nothing decoded here leaves the
+		// transaction: the merged map is encoded into buf and written on
+		// the line below, all of it before the closure returns. Read and
+		// Scan hand their maps to the caller, which is what made the same
+		// flag a bug there. tamnd/zu#726.
 		txn.RawRead = true
 		data := make(map[string][]byte, len(values))
 		v, err := txn.Get(db.dbi, rowKey)
