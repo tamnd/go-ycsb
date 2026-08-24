@@ -18,35 +18,33 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/dgraph-io/badger"
-	"github.com/dgraph-io/badger/options"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
 )
 
-//  properties
+// properties
 const (
 	badgerDir                     = "badger.dir"
 	badgerValueDir                = "badger.valuedir"
 	badgerSyncWrites              = "badger.sync_writes"
 	badgerNumVersionsToKeep       = "badger.num_versions_to_keep"
-	badgerMaxTableSize            = "badger.max_table_size"
+	badgerBaseTableSize           = "badger.base_table_size"
 	badgerLevelSizeMultiplier     = "badger.level_size_multiplier"
 	badgerMaxLevels               = "badger.max_levels"
 	badgerValueThreshold          = "badger.value_threshold"
 	badgerNumMemtables            = "badger.num_memtables"
 	badgerNumLevelZeroTables      = "badger.num_level0_tables"
 	badgerNumLevelZeroTablesStall = "badger.num_level0_tables_stall"
-	badgerLevelOneSize            = "badger.level_one_size"
+	badgerBaseLevelSize           = "badger.base_level_size"
 	badgerValueLogFileSize        = "badger.value_log_file_size"
 	badgerValueLogMaxEntries      = "badger.value_log_max_entries"
 	badgerNumCompactors           = "badger.num_compactors"
-	badgerDoNotCompact            = "badger.do_not_compact"
-	badgerTableLoadingMode        = "badger.table_loading_mode"
-	badgerValueLogLoadingMode     = "badger.value_log_loading_mode"
-	// TODO: add more configurations
+	badgerBlockCacheSize          = "badger.block_cache_size"
+	badgerIndexCacheSize          = "badger.index_cache_size"
+	badgerCompression             = "badger.compression"
 )
 
 type badgerCreator struct {
@@ -90,42 +88,46 @@ func (c badgerCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 }
 
 func getOptions(p *properties.Properties) badger.Options {
-	opts := badger.DefaultOptions
-	opts.Dir = p.GetString(badgerDir, "/tmp/badger")
-	opts.ValueDir = p.GetString(badgerValueDir, opts.Dir)
+	// v4 takes the directory as an argument rather than as a field on a
+	// package level default, and several of the tuning fields this
+	// adapter used to set were renamed or removed along the way:
+	// MaxTableSize became BaseTableSize, LevelOneSize became
+	// BaseLevelSize, and TableLoadingMode, ValueLogLoadingMode and
+	// DoNotCompact are gone because v2 stopped choosing between mmap and
+	// file IO per table. The property names here follow the fields so a
+	// reader of a run's arguments can find them in Badger's own docs.
+	dir := p.GetString(badgerDir, "/tmp/badger")
+	opts := badger.DefaultOptions(dir)
+	opts.ValueDir = p.GetString(badgerValueDir, dir)
+
+	// Quiet. Badger logs every table build and every compaction at INFO
+	// to standard error by default, and this harness reads the process
+	// output looking for rows, so a chatty engine is an engine whose
+	// numbers are harder to find and whose logging is being timed.
+	opts.Logger = nil
 
 	opts.SyncWrites = p.GetBool(badgerSyncWrites, false)
 	opts.NumVersionsToKeep = p.GetInt(badgerNumVersionsToKeep, 1)
-	opts.MaxTableSize = p.GetInt64(badgerMaxTableSize, 64<<20)
+	opts.BaseTableSize = p.GetInt64(badgerBaseTableSize, 64<<20)
 	opts.LevelSizeMultiplier = p.GetInt(badgerLevelSizeMultiplier, 10)
 	opts.MaxLevels = p.GetInt(badgerMaxLevels, 7)
-	opts.ValueThreshold = p.GetInt(badgerValueThreshold, 32)
+	opts.ValueThreshold = p.GetInt64(badgerValueThreshold, 1<<10)
 	opts.NumMemtables = p.GetInt(badgerNumMemtables, 5)
 	opts.NumLevelZeroTables = p.GetInt(badgerNumLevelZeroTables, 5)
 	opts.NumLevelZeroTablesStall = p.GetInt(badgerNumLevelZeroTablesStall, 10)
-	opts.LevelOneSize = p.GetInt64(badgerLevelOneSize, 256<<20)
+	opts.BaseLevelSize = p.GetInt64(badgerBaseLevelSize, 256<<20)
 	opts.ValueLogFileSize = p.GetInt64(badgerValueLogFileSize, 1<<30)
 	opts.ValueLogMaxEntries = uint32(p.GetUint64(badgerValueLogMaxEntries, 1000000))
-	opts.NumCompactors = p.GetInt(badgerNumCompactors, 3)
-	opts.DoNotCompact = p.GetBool(badgerDoNotCompact, false)
-	if b := p.GetString(badgerTableLoadingMode, "LoadToRAM"); len(b) > 0 {
-		if b == "FileIO" {
-			opts.TableLoadingMode = options.FileIO
-		} else if b == "LoadToRAM" {
-			opts.TableLoadingMode = options.LoadToRAM
-		} else if b == "MemoryMap" {
-			opts.TableLoadingMode = options.MemoryMap
-		}
-	}
-	if b := p.GetString(badgerValueLogLoadingMode, "MemoryMap"); len(b) > 0 {
-		if b == "FileIO" {
-			opts.ValueLogLoadingMode = options.FileIO
-		} else if b == "LoadToRAM" {
-			opts.ValueLogLoadingMode = options.LoadToRAM
-		} else if b == "MemoryMap" {
-			opts.ValueLogLoadingMode = options.MemoryMap
-		}
-	}
+	opts.NumCompactors = p.GetInt(badgerNumCompactors, 4)
+
+	// Both caches are off by default in v4 and both matter here for the
+	// reason the sqlite and pebble adapters give: a read that misses
+	// every cache goes to the device, and an engine measured entirely on
+	// device reads is being measured against the device. The numbers are
+	// deliberately not gigabytes, since a run that swaps is a benchmark
+	// of the swap.
+	opts.BlockCacheSize = p.GetInt64(badgerBlockCacheSize, 256<<20)
+	opts.IndexCacheSize = p.GetInt64(badgerIndexCacheSize, 128<<20)
 
 	return opts
 }
@@ -153,29 +155,45 @@ func (db *badgerDB) Read(ctx context.Context, table string, key string, fields [
 		if err != nil {
 			return err
 		}
-		row, err := item.Value()
-		if err != nil {
+		// Value hands the stored bytes to a callback and they are only
+		// valid inside it, which is why the decode happens in there. The
+		// v1 API returned the slice directly and this adapter kept it
+		// past the transaction, which v4 will not allow.
+		return item.Value(func(row []byte) error {
+			m, err = db.r.Decode(row, fields)
 			return err
-		}
-
-		m, err = db.r.Decode(row, fields)
-		return err
+		})
 	})
 
+	if err == badger.ErrKeyNotFound {
+		// A key that is not there is not an error to YCSB, it is an empty
+		// result, and reporting it as an error makes a workload that
+		// reads a key it never wrote fail the run instead of counting a
+		// miss.
+		return nil, nil
+	}
 	return m, err
 }
 
 func (db *badgerDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	res := make([]map[string][]byte, count)
+	// Appended rather than filled to count. Sizing the slice to count and
+	// writing into it left every position a short scan did not reach as a
+	// nil map, so a scan that found ten rows returned ten rows and forty
+	// nils and the caller could not tell the difference between a row
+	// that was not there and a row that was empty. The scan integrity
+	// check reads those nils as rows carrying no key.
+	res := make([]map[string][]byte, 0, count)
 	err := db.db.View(func(txn *badger.Txn) error {
 		rowStartKey := db.getRowKey(table, startKey)
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		// Prefix bound so the walk stops at the end of this table rather
+		// than carrying on into whatever is stored after it.
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = util.Slice(fmt.Sprintf("%s:", table))
+		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		i := 0
-		for it.Seek(rowStartKey); it.Valid() && i < count; it.Next() {
-			item := it.Item()
-			value, err := item.ValueCopy(nil)
+		for it.Seek(rowStartKey); it.Valid() && len(res) < count; it.Next() {
+			value, err := it.Item().ValueCopy(nil)
 			if err != nil {
 				return err
 			}
@@ -185,8 +203,7 @@ func (db *badgerDB) Scan(ctx context.Context, table string, startKey string, cou
 				return err
 			}
 
-			res[i] = m
-			i++
+			res = append(res, m)
 		}
 
 		return nil
@@ -203,13 +220,12 @@ func (db *badgerDB) Update(ctx context.Context, table string, key string, values
 			return err
 		}
 
-		value, err := item.Value()
-		if err != nil {
+		var data map[string][]byte
+		if err := item.Value(func(value []byte) error {
+			var err error
+			data, err = db.r.Decode(value, nil)
 			return err
-		}
-
-		data, err := db.r.Decode(value, nil)
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 

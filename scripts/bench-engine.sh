@@ -120,6 +120,16 @@ case "$ENGINE" in
     ENGINE_ARGS=(-p redis.addr="${REDIS_ADDR:-127.0.0.1:$([ "$ENGINE" = valkey ] && echo 56380 || echo 56379)}"
                  -p redis.datatype="${REDIS_DATATYPE:-hash}")
     ;;
+  badger)
+    # Badger's value log is the thing that separates it from every other
+    # LSM here: values above a threshold live in their own log and the
+    # tree carries a pointer, which is the WiscKey design. A YCSB record
+    # at ten fields of a hundred bytes is about a kilobyte encoded, so it
+    # sits right on the adapter's threshold, and that is the interesting
+    # place to measure it rather than a number picked to keep every value
+    # inline or push every value out.
+    ENGINE_ARGS=(-p "badger.dir=$DATA.badger")
+    ;;
   pebble)
     # Everything else takes the adapter's defaults, which are Pebble's
     # own except for the block cache. Eight MiB is the library default
@@ -160,6 +170,7 @@ reset_data() {
     ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
                    "$DATA.lbug.checkpoint.apply.lock" \
                    "$DATA.lbug.checkpoint.intent.lock" ;;
+    badger)  rm -rf "$DATA.badger" ;;
     pebble)  rm -rf "$DATA.pebble" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # A zu2 database is a log and three sidecars beside it, and removing
@@ -422,7 +433,7 @@ space() {  # space <workload> <phase>
   # on gamingpc for workload b and the log said nothing.
   if [ "${kb:-0}" -le 0 ]; then
     case "$ENGINE" in
-      sqlite|duckdb|ladybug|pebble|zu|zu2)
+      sqlite|duckdb|ladybug|badger|pebble|zu|zu2)
         echo "# $1 $2: WRONG, $ENGINE left nothing at $DATA.*" | tee -a "$OUT"
         ;;
     esac
