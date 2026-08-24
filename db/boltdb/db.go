@@ -173,6 +173,19 @@ func (db *boltDB) Scan(ctx context.Context, table string, startKey string, count
 }
 
 func (db *boltDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+	// Taken and released outside the transaction. bolt says the value
+	// given to Put must stay valid for the life of the transaction: it
+	// keeps the slice in the node and writes it at commit rather than
+	// copying it. Releasing it inside the closure, which is what this used
+	// to do, put it back in the pool before the commit, and BufPool.Get
+	// only reslices to zero length, so the next Encode on any thread
+	// overwrote a value bolt had not written yet. Same bug as 00d9f3e
+	// fixed in badger.
+	buf := db.bufPool.Get()
+	defer func() {
+		db.bufPool.Put(buf)
+	}()
+
 	err := db.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(table))
 		if bucket == nil {
@@ -193,11 +206,6 @@ func (db *boltDB) Update(ctx context.Context, table string, key string, values m
 			data[field] = value
 		}
 
-		buf := db.bufPool.Get()
-		defer func() {
-			db.bufPool.Put(buf)
-		}()
-
 		buf, err = db.r.Encode(buf, data)
 		if err != nil {
 			return err
@@ -209,25 +217,25 @@ func (db *boltDB) Update(ctx context.Context, table string, key string, values m
 }
 
 func (db *boltDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	err := db.db.Update(func(tx *bolt.Tx) error {
+	// Encoded before the transaction and released after it, for the reason
+	// Update gives: bolt keeps the slice Put is given until the commit.
+	buf := db.bufPool.Get()
+	defer func() {
+		db.bufPool.Put(buf)
+	}()
+
+	buf, err := db.r.Encode(buf, values)
+	if err != nil {
+		return err
+	}
+
+	return db.db.Update(func(tx *bolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(table))
 		if err != nil {
 			return err
 		}
-
-		buf := db.bufPool.Get()
-		defer func() {
-			db.bufPool.Put(buf)
-		}()
-
-		buf, err = db.r.Encode(buf, values)
-		if err != nil {
-			return err
-		}
-
 		return bucket.Put([]byte(key), buf)
 	})
-	return err
 }
 
 func (db *boltDB) Delete(ctx context.Context, table string, key string) error {
