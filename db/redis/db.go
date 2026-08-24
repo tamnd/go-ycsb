@@ -409,4 +409,17 @@ func init() {
 	// harness so that a run says which of the two it measured, the same
 	// way pg registers cockroach beside itself.
 	ycsb.RegisterDBCreator("valkey", redisCreator{})
+	// KeyDB and Garnet are here for the same reason and by the same
+	// route. KeyDB is the multithreaded Redis fork, so it is the row that
+	// says how much of Redis's number is the single event loop rather
+	// than the protocol or the data structures. Garnet is Microsoft's
+	// server, written in C# on top of their Tsavorite key value store,
+	// and it answers RESP without sharing a line of Redis's code, which
+	// makes it the most interesting of the four: same wire, same
+	// adapter, same workload, an entirely different engine underneath.
+	// Every one of them is measured through this adapter and against
+	// this harness, so the four rows are comparable to each other and to
+	// everything else in the table.
+	ycsb.RegisterDBCreator("keydb", redisCreator{})
+	ycsb.RegisterDBCreator("garnet", redisCreator{})
 }

@@ -24,6 +24,8 @@ MONGO_PORT="${MONGO_PORT:-57017}"
 # data.
 REDIS_PORT="${REDIS_PORT:-56379}"
 VALKEY_PORT="${VALKEY_PORT:-56380}"
+KEYDB_PORT="${KEYDB_PORT:-56381}"
+GARNET_PORT="${GARNET_PORT:-56382}"
 
 # Sized against a 32 GB host. Both get enough that the whole working set
 # is resident, because a benchmark that pages is measuring the disk.
@@ -33,7 +35,7 @@ SHARED_BUFFERS="${PG_SHARED_BUFFERS:-8GB}"
 WT_CACHE="${MONGO_WT_CACHE:-8}"
 
 up() {
-  docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb >/dev/null 2>&1
+  docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb >/dev/null 2>&1
 
   docker run -d --name neo4j-ycsb --restart unless-stopped \
     -p "$BOLT_PORT":7687 -p 7474:7474 \
@@ -89,6 +91,24 @@ up() {
     -p "$VALKEY_PORT":6379 \
     valkey/valkey:latest valkey-server --save "" --appendonly no >/dev/null
 
+  # KeyDB is the multithreaded fork. server-threads is the whole reason
+  # it is in the table, so it is set rather than left at the default of
+  # one, which would make it Redis with extra steps. Eight is what the
+  # project suggests as a sane ceiling and is a quarter of the cores on
+  # the smallest host here.
+  docker run -d --name keydb-ycsb --restart unless-stopped \
+    -p "$KEYDB_PORT":6379 \
+    eqalpha/keydb:latest keydb-server --save "" --appendonly no \
+      --server-threads "${KEYDB_THREADS:-8}" >/dev/null
+
+  # Garnet keeps its checkpoints and its log under one directory and
+  # takes neither by default, so there is nothing to turn off here the
+  # way there is for the other three. It is not Redis derived, it only
+  # speaks the same protocol.
+  docker run -d --name garnet-ycsb --restart unless-stopped \
+    -p "$GARNET_PORT":6379 \
+    ghcr.io/microsoft/garnet:latest --port 6379 >/dev/null
+
 }
 
 # restart unless-stopped only helps once the docker daemon is back. On
@@ -105,14 +125,14 @@ up() {
 # that is restarting is rebuilt from nothing instead of waited on.
 start_existing() {
   local name
-  for name in neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb; do
+  for name in neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb; do
     case "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" in
       # Nothing there at all, which is a first run on this host.
       "")           echo "building both, $name is not there"; up; return ;;
       restarting)   echo "rebuilding both, $name is crash looping"; up; return ;;
     esac
   done
-  docker start neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb >/dev/null 2>&1
+  docker start neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb >/dev/null 2>&1
 }
 
 wait_ready() {
@@ -122,6 +142,15 @@ wait_ready() {
        docker exec mongo-ycsb mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 &&
        docker exec redis-ycsb redis-cli ping >/dev/null 2>&1 &&
        docker exec valkey-ycsb valkey-cli ping >/dev/null 2>&1 &&
+       docker exec keydb-ycsb keydb-cli ping >/dev/null 2>&1 &&
+       # Garnet ships no client of its own in the image, so it is asked
+       # with a throwaway redis-cli sharing its network namespace. That
+       # is why this reads localhost and port 6379 rather than the
+       # published port: inside the namespace it is the same interface
+       # Garnet is listening on, and it does not depend on the container
+       # being able to route back to the host.
+       docker run --rm --network container:garnet-ycsb redis:latest \
+         redis-cli ping >/dev/null 2>&1 &&
        docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
          'RETURN 1' >/dev/null 2>&1; then
       echo "servers ready after ${i}s"
@@ -129,6 +158,9 @@ wait_ready() {
       docker exec mongo-ycsb mongosh --quiet --eval 'db.version()'
       docker exec redis-ycsb redis-cli info server | sed -n 's/^redis_version:/redis /p'
       docker exec valkey-ycsb valkey-cli info server | sed -n 's/^valkey_version:/valkey /p'
+      docker exec keydb-ycsb keydb-cli info server | sed -n 's/^redis_version:/keydb /p'
+      docker run --rm --network container:garnet-ycsb redis:latest \
+        redis-cli info server | sed -n 's/^garnet_version:/garnet /p'
       docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
         'call dbms.components() yield name, versions return name, versions' | tail -3
       return 0
@@ -143,6 +175,6 @@ wait_ready() {
 case "${1:-up}" in
   up)   up; wait_ready ;;
   wait) start_existing; wait_ready ;;
-  down) docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb ;;
+  down) docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb ;;
   *)    echo "usage: $0 [up|down|wait]" >&2; exit 2 ;;
 esac

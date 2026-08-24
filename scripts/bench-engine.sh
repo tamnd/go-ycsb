@@ -99,7 +99,7 @@ case "$ENGINE" in
     # synchronous_commit=off.
     ENGINE_ARGS=(-p mongodb.url="${MONGO_URL:-mongodb://127.0.0.1:57017/ycsb?w=1}")
     ;;
-  redis|valkey)
+  redis|valkey|keydb|garnet)
     # Two engines out of one adapter. Valkey is the fork the Linux
     # Foundation took on when Redis changed its licence, it speaks the
     # same wire protocol, and go-redis talks to it without knowing the
@@ -117,7 +117,13 @@ case "$ENGINE" in
     # a first pass over a Docker bridge on macOS, which is a measurement
     # of the bridge, so this is being taken again on the Linux hosts and
     # both modes go in the table the way sqlite's modes do.
-    ENGINE_ARGS=(-p redis.addr="${REDIS_ADDR:-127.0.0.1:$([ "$ENGINE" = valkey ] && echo 56380 || echo 56379)}"
+    case "$ENGINE" in
+      redis)  port=56379 ;;
+      valkey) port=56380 ;;
+      keydb)  port=56381 ;;
+      garnet) port=56382 ;;
+    esac
+    ENGINE_ARGS=(-p redis.addr="${REDIS_ADDR:-127.0.0.1:$port}"
                  -p redis.datatype="${REDIS_DATATYPE:-hash}")
     ;;
   badger)
@@ -189,7 +195,7 @@ reset_data() {
     # would be charged to the workload that did not write it.
     zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
                    "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
-    pg|neo4j|mongodb|redis|valkey) : ;;  # nothing on this side, see LOAD_ARGS below
+    pg|neo4j|mongodb|redis|valkey|keydb|garnet) : ;;  # nothing on this side, see LOAD_ARGS below
   esac
   # The reset knows one path per engine and the engines keep more than
   # one, which is how ladybug ran a whole sweep beside an orphaned write
@@ -211,7 +217,7 @@ reset_data() {
 # the first and every insert after A would be a duplicate key.
 LOAD_ARGS=()
 case "$ENGINE" in
-  pg|neo4j|mongodb|redis|valkey) LOAD_ARGS=(-p dropdata=true) ;;
+  pg|neo4j|mongodb|redis|valkey|keydb|garnet) LOAD_ARGS=(-p dropdata=true) ;;
 esac
 
 field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | head -1; }
@@ -321,14 +327,26 @@ storage() {  # storage <workload> <phase> <output>
 # for the same reason: the benchmark hosts have psql and sqlite3 and none
 # of them has redis-cli. Either way this is the server being asked rather
 # than the client being believed.
+#
+# KeyDB ships keydb-cli in its own image and Garnet ships no client at
+# all, so the fallback for those two is a throwaway redis-cli container
+# sharing the server's network namespace. That is one container start
+# per question, which is why it is only the fallback and only used for
+# the space and row count lines, never inside a timed phase.
 redis_cli() {
   local port container
   case "$ENGINE" in
     valkey) port=56380; container=valkey-ycsb ;;
+    keydb)  port=56381; container=keydb-ycsb ;;
+    garnet) port=56382; container=garnet-ycsb ;;
     *)      port=56379; container=redis-ycsb ;;
   esac
   if command -v redis-cli >/dev/null 2>&1; then
     redis-cli -h 127.0.0.1 -p "$port" "$@"
+  elif [ "$ENGINE" = keydb ]; then
+    docker exec "$container" keydb-cli "$@"
+  elif [ "$ENGINE" = garnet ]; then
+    docker run --rm --network "container:$container" redis:latest redis-cli "$@"
   else
     docker exec "$container" redis-cli "$@"
   fi
@@ -366,7 +384,7 @@ space() {  # space <workload> <phase>
   # fragmentation and an in memory engine compared on the smaller of the
   # two is being flattered.
   case "$ENGINE" in
-    redis|valkey)
+    redis|valkey|keydb|garnet)
       local ru rr
       ru=$(redis_cli info memory 2>/dev/null | sed -n 's/^used_memory:\([0-9]*\).*/\1/p' | tr -d '[:space:]')
       rr=$(redis_cli info memory 2>/dev/null | sed -n 's/^used_memory_rss:\([0-9]*\).*/\1/p' | tr -d '[:space:]')
@@ -480,14 +498,14 @@ space() {  # space <workload> <phase>
 # column beside four embedded engines is worse than a blank.
 timed() {  # timed <argv...>
   case "$ENGINE" in
-    pg|neo4j|mongodb|redis|valkey) "$@" ;;
+    pg|neo4j|mongodb|redis|valkey|keydb|garnet) "$@" ;;
     *) if [ -n "$TIME_BIN" ]; then "$TIME_BIN" -v "$@"; else "$@"; fi ;;
   esac
 }
 
 maxrss() {  # maxrss <workload> <phase> <output>
   case "$ENGINE" in
-    pg|neo4j|mongodb|redis|valkey)
+    pg|neo4j|mongodb|redis|valkey|keydb|garnet)
       echo "# $1 $2: $ENGINE keeps its data in a server process, no memory figure from this side" \
         | tee -a "$OUT"
       return 0
@@ -562,7 +580,7 @@ rows() {  # rows <workload> <phase> [output]
               -u "${NEO4J_USER:-neo4j}" -p "${NEO4J_PASSWORD:-benchpass}" \
               --format plain 'match (r:usertable) return count(r)' 2>/dev/null | tail -1)
       ;;
-    redis|valkey)
+    redis|valkey|keydb|garnet)
       # DBSIZE is the number of keys in the database, and with one key a
       # record and a flush before each load that is the record count.
       redis_cli ping >/dev/null 2>&1 && have=yes && n=$(redis_cli dbsize 2>/dev/null)
@@ -616,7 +634,7 @@ SKIP=""
 # out of their rows instead of being filled with an error or, worse, with
 # a fast number for a cheaper question.
 case "$ENGINE" in
-  redis|valkey) SKIP="e" ;;
+  redis|valkey|keydb|garnet) SKIP="e" ;;
 esac
 
 # One small self check before the sweep, because throughput is worth
