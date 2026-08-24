@@ -66,14 +66,30 @@ for e in "${ENGINES[@]}"; do
   # variable replaces that rather than adding to it, so the default has
   # to be written out or the sqlite amalgamation compiles at -O0 and the
   # fix below costs more than it saves.
-  cflags="${CGO_CFLAGS:--O2 -g}"
+  #
+  # -O2 -g leads and the caller's flags follow, rather than the caller
+  # replacing it. Writing it as ${CGO_CFLAGS:--O2 -g} meant a caller who
+  # set CGO_CFLAGS for one engine took the optimisation away from all of
+  # them: gp-run.sh exports an include path so the sweep can find zu2's
+  # header, and that alone was enough to compile the sqlite amalgamation
+  # at -O0, which is the exact failure the paragraph above describes.
+  # Anything the caller passes comes after and so still wins.
+  cflags="-O2 -g ${CGO_CFLAGS:-}"
   if [ "$e" = sqlite ]; then
     cflags="$cflags -DSQLITE_DEFAULT_MEMSTATUS=0"
   fi
 
+  # Appended rather than only used when CGO_LDFLAGS is empty. The empty
+  # test assumed the variable is either unset or already ladybug's, and a
+  # caller that sets it for a different engine breaks that: gp-run.sh
+  # exports CGO_LDFLAGS pointing at libzu2 so the whole sweep can link
+  # zu2, which silently took -latomic away from ladybug, and ladybug then
+  # failed to link on a host where its library was installed and fine.
+  # Appending gives every engine what it needs and leaves what the caller
+  # asked for in place.
   ldflags="${CGO_LDFLAGS:-}"
-  if [ "$e" = ladybug ] && [ -z "$ldflags" ] && [ "$(uname -s)" = Linux ]; then
-    ldflags="-L${LBUG_LIB:-/usr/local/lib} -llbug -lssl -lcrypto -latomic -lstdc++ -lm -ldl -Wl,-rpath,${LBUG_LIB:-/usr/local/lib}"
+  if [ "$e" = ladybug ] && [ "$(uname -s)" = Linux ]; then
+    ldflags="$ldflags -L${LBUG_LIB:-/usr/local/lib} -llbug -lssl -lcrypto -latomic -lstdc++ -lm -ldl -Wl,-rpath,${LBUG_LIB:-/usr/local/lib}"
   fi
 
   echo "building $WORK/ycsb-$e${tag:+ (tag $tag)}"
