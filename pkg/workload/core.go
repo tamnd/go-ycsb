@@ -608,12 +608,21 @@ func (c *core) doTransactionReadModifyWrite(ctx context.Context, db ycsb.DB, sta
 		return err
 	}
 
-	if err := db.Update(ctx, c.table, keyName, values); err != nil {
-		return err
-	}
-
+	// Before the update, not after it. A driver is only promising that
+	// what a read hands back is good until the next call on the same
+	// connection, and the update is that next call. zu2 takes the promise
+	// literally: a read borrows the engine's own pages and holds an epoch
+	// over them, and the next call releases the epoch, after which a
+	// compaction pass running beside this one is free to unmap them. So a
+	// verify placed after the update reads freed pages. Checking what was
+	// read before overwriting it is the right order for every driver
+	// anyway, and it costs nothing.
 	if c.dataIntegrity {
 		c.verifyRow(state, keyName, readValues)
+	}
+
+	if err := db.Update(ctx, c.table, keyName, values); err != nil {
+		return err
 	}
 
 	return nil
