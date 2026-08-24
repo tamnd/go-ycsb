@@ -182,6 +182,17 @@ type session struct {
 	// (#678). See Read for what the caller is promised about them.
 	row  []byte
 	vals map[string][]byte
+	// And the same again for a scan, one map a row rather than one a
+	// session because the caller gets every row of a scan at once and
+	// they have to be live together. The slice and the maps in it both
+	// grow to the largest scan and are then reused. Workload E returns
+	// fifty rows a scan, so this is fifty makemaps an operation that
+	// the collector does not have to take back afterwards. The rows
+	// already point into s.rows, so a caller that holds them past the
+	// next call on this session was already reading a reused buffer and
+	// this promises it nothing new.
+	scanVals []map[string][]byte
+	scanRows []map[string][]byte
 }
 
 type zu2DB struct {
@@ -513,7 +524,7 @@ func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count 
 	s.rows = s.rows[:total]
 
 	prefix := []byte(table + ":")
-	got := make([]map[string][]byte, 0, int(returned))
+	got := s.scanRows[:0]
 	at := 0
 	for _, pair := range all {
 		key := unsafe.Slice((*byte)(unsafe.Pointer(pair.key)), int(pair.key_len))
@@ -523,12 +534,20 @@ func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count 
 		row := s.rows[at : at+int(pair.value_len)]
 		copy(row, unsafe.Slice((*byte)(unsafe.Pointer(pair.value)), int(pair.value_len)))
 		at += int(pair.value_len)
-		values, err := db.r.Decode(row, fields)
+		// One map per row position, kept between scans. The map at
+		// position i belongs to row i of this scan and DecodeInto
+		// clears it, so nothing of the previous scan's row i is left
+		// in it.
+		if len(s.scanVals) <= len(got) {
+			s.scanVals = append(s.scanVals, make(map[string][]byte, 16))
+		}
+		values, err := db.r.DecodeInto(row, fields, s.scanVals[len(got)])
 		if err != nil {
 			return nil, err
 		}
 		got = append(got, values)
 	}
+	s.scanRows = got
 	return got, nil
 }
 

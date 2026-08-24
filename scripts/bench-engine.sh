@@ -455,7 +455,7 @@ SKIP=""
 # Ten thousand records rather than the sweep's count, since this is a
 # correctness check and not a measurement, and it costs a few seconds.
 verify() {
-  local records=10000 raw
+  local records=10000 raw got
   reset_data
   raw=$("$BIN" load "$ENGINE" -P workloads/workloadc "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}"     -p dataintegrity=true -p recordcount="$records" -p threadcount=1 2>&1) || true
   if ! grep -qE '^(INSERT|TOTAL) ' <<<"$raw"; then
@@ -468,6 +468,39 @@ verify() {
   else
     echo "# verify: WRONG, $ENGINE failed the data integrity read" | tee -a "$OUT"
     grep -iE 'unexpected|no fields|error' <<<"$raw" | head -3 | while IFS= read -r line; do
+      echo "# verify: $line" | tee -a "$OUT"
+    done
+  fi
+
+  # And the same for the scan path, which is a separate check because it
+  # was a separate hole: dataintegrity only ever looked at what a read
+  # returned, so no value workload E handed back was examined by anything
+  # for any engine. A scanned row names its own key inside its value, so
+  # this checks the values, that the keys climb from the one asked for,
+  # and that no row carries a field belonging to another. That last one
+  # is what a driver reusing buffers or maps between rows gets wrong.
+  local scan=()
+  [ "$ENGINE" = zu2 ] && scan=(-p "zu2.ordered=true")
+  case " $SKIP " in
+    *" e "*)
+      echo "# verify: $ENGINE has no scan to check" | tee -a "$OUT"
+      return 0 ;;
+  esac
+  reset_data
+  raw=$("$BIN" load "$ENGINE" -P workloads/workloade "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${scan[@]+"${scan[@]}"}" "${LOAD_ARGS[@]+"${LOAD_ARGS[@]}"}"     -p dataintegrity=true -p recordcount="$records" -p threadcount=1 2>&1) || true
+  if ! grep -qE '^(INSERT|TOTAL) ' <<<"$raw"; then
+    echo "# verify: WRONG, $ENGINE could not load the scan integrity set" | tee -a "$OUT"
+    return 0
+  fi
+  raw=$("$BIN" run "$ENGINE" -P workloads/workloade "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${scan[@]+"${scan[@]}"}"     -p dataintegrity=true -p recordcount="$records" -p operationcount=$((records / 2)) -p threadcount=1 2>&1) || true
+  # A run that returns no rows at all passes every value check there is
+  # by having nothing to check, so the row count is part of the verdict.
+  got=$(grep -oE '^scan rows: [0-9]+' <<<"$raw" | grep -oE '[0-9]+' || true)
+  if grep -qE '^(SCAN|TOTAL) ' <<<"$raw" && [ "${got:-0}" -gt 0 ]; then
+    echo "# verify: $ENGINE scanned $got rows and every one of them held up" | tee -a "$OUT"
+  else
+    echo "# verify: WRONG, $ENGINE failed the data integrity scan" | tee -a "$OUT"
+    grep -iE 'unexpected|no fields|mixes rows|do not climb|before the start|carries no key|error' <<<"$raw" | head -3 | while IFS= read -r line; do
       echo "# verify: $line" | tee -a "$OUT"
     done
   fi

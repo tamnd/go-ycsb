@@ -318,6 +318,68 @@ func (c *core) buildDeterministicValue(state *coreState, key string, fieldKey st
 	return b.Bytes()
 }
 
+// verifyScan is verifyRow for a range scan.
+//
+// Scan hands back rows and not the keys they came from, so there is
+// nothing to derive an expected value from the way a read has. The rows
+// carry it themselves: a deterministic value opens with the key of the
+// row it belongs to followed by a colon, so every value names its own
+// key and can be rebuilt and compared once that key is read back out of
+// it.
+//
+// This exists because dataintegrity checked reads and left scans alone,
+// so nothing in the harness ever looked at a value workload E returned.
+// That is the hole tamnd/zu#551 went through on the read path, still
+// open on the scan path, and it is the one place a driver that reuses
+// buffers or maps between rows would show up.
+func (c *core) verifyScan(state *coreState, startKey string, rows []map[string][]byte) {
+	last := ""
+	for i, values := range rows {
+		if len(values) == 0 {
+			util.Fatalf("scan from %s: row %d came back with no fields at all", startKey, i)
+		}
+
+		key := ""
+		for fieldKey, value := range values {
+			at := bytes.IndexByte(value, ':')
+			if at < 0 {
+				util.Fatalf("scan from %s: row %d field %s carries no key, got %q",
+					startKey, i, fieldKey, value)
+			}
+			rowKey := string(value[:at])
+			// Every field of one row has to name the same key. A driver
+			// that hands back one map per row and fills them from a
+			// buffer it reuses would leak a field of the row before into
+			// this one, and this is what that looks like.
+			if key == "" {
+				key = rowKey
+			} else if rowKey != key {
+				util.Fatalf("scan from %s: row %d mixes rows, field %s belongs to %s and the rest to %s",
+					startKey, i, fieldKey, rowKey, key)
+			}
+			expected := c.buildDeterministicValue(state, rowKey, fieldKey)
+			if !bytes.Equal(expected, value) {
+				util.Fatalf("scan from %s: row %d field %s, expect %q, but got %q",
+					startKey, i, fieldKey, expected, value)
+			}
+		}
+
+		// A scan is a range read, so what comes back starts at the key
+		// asked for and climbs. The interface comment does not spell
+		// that out, but every driver here implements it and workload E
+		// is measuring a range scan, so rows outside the range or in no
+		// order are a wrong answer being timed as a fast one.
+		if key < startKey {
+			util.Fatalf("scan from %s: row %d is key %s, which is before the start",
+				startKey, i, key)
+		}
+		if last != "" && key <= last {
+			util.Fatalf("scan from %s: keys do not climb, %s then %s", startKey, last, key)
+		}
+		last = key
+	}
+}
+
 func (c *core) verifyRow(state *coreState, key string, values map[string][]byte) {
 	// An empty row is the failure this check exists to catch, not a
 	// case to skip. An engine that stored the key and dropped the
@@ -587,6 +649,10 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 	c.scans.Add(1)
 	c.scanAsked.Add(int64(scanLen))
 	c.scanRows.Add(int64(len(rows)))
+
+	if err == nil && c.dataIntegrity {
+		c.verifyScan(state, startKeyName, rows)
+	}
 
 	return err
 }
