@@ -36,9 +36,26 @@ if [ "$need_servers" = 1 ]; then
 fi
 
 echo "### build"
-bash scripts/build-engine.sh "${ENGINES[@]}" || exit 1
-
+# One engine at a time, and an engine that will not build is named and
+# left out rather than taking the sweep with it. Building the whole set
+# in one call meant a missing ladybug header on server2 cost sqlite and
+# duckdb as well, and the sweep reported nothing at all for a host where
+# two of the three engines were fine.
+RUN=()
 for e in "${ENGINES[@]}"; do
+  if bash scripts/build-engine.sh "$e"; then
+    RUN+=("$e")
+  else
+    echo "### $e will not build on this host, leaving it out"
+  fi
+done
+if [ ${#RUN[@]} -eq 0 ]; then
+  echo "### nothing built, so there is nothing to run" >&2
+  exit 1
+fi
+echo "### running: ${RUN[*]}"
+
+for e in "${RUN[@]}"; do
   echo "### $e"
   bash scripts/bench-engine.sh "$e" "$RECORDS" "$THREADS"
 done
