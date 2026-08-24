@@ -193,6 +193,13 @@ type session struct {
 	// this promises it nothing new.
 	scanVals []map[string][]byte
 	scanRows []map[string][]byte
+	// And once more for a batch read, which is the same problem again:
+	// every row of the batch comes back at once, so each key needs its
+	// own buffer and its own map or they all end up holding the last
+	// row read.
+	batchRow  [][]byte
+	batchVals []map[string][]byte
+	batchOut  []map[string][]byte
 }
 
 type zu2DB struct {
@@ -444,8 +451,13 @@ func dbErr(db *C.zu2_db, st C.zu2_status, fallback string) error {
 	return fmt.Errorf("%s (status %d)", fallback, int(st))
 }
 
-func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
-	s := sessionOf(ctx)
+// readOne is a read with the caller saying where the row bytes and the
+// decoded fields land. Read points both at storage the session keeps and
+// reuses, since it hands back one row at a time. BatchRead gives every
+// key of the batch its own, since it hands back all of them together.
+//
+// The buffer comes back out because appending to it may move it.
+func (db *zu2DB) readOne(s *session, table string, key string, fields []string, buf []byte, into map[string][]byte) (map[string][]byte, []byte, error) {
 	rk := s.rowKey(table, key)
 
 	var val *C.uint8_t
@@ -453,10 +465,10 @@ func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []st
 	var found C.int
 	st := C.zu2_read(s.s, ptr(rk), C.size_t(len(rk)), &val, &valLen, &found)
 	if st != C.ZU2_OK {
-		return nil, sessionErr(s.s, st, fmt.Sprintf("zu2: read %q failed", key))
+		return nil, buf, sessionErr(s.s, st, fmt.Sprintf("zu2: read %q failed", key))
 	}
 	if found == 0 {
-		return nil, nil
+		return nil, buf, nil
 	}
 
 	// A copy, and it has to be: the engine's buffer belongs to the
@@ -470,11 +482,19 @@ func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []st
 	// Scan already makes here: the map and the values in it are good
 	// until the next call on this connection, which for a go-ycsb
 	// worker is the rest of the operation it is in the middle of.
-	s.row = append(s.row[:0], unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen))...)
+	buf = append(buf[:0], unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen))...)
+	m, err := db.r.DecodeInto(buf, fields, into)
+	return m, buf, err
+}
+
+func (db *zu2DB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	s := sessionOf(ctx)
 	if s.vals == nil {
 		s.vals = make(map[string][]byte, 16)
 	}
-	return db.r.DecodeInto(s.row, fields, s.vals)
+	m, buf, err := db.readOne(s, table, key, fields, s.row, s.vals)
+	s.row = buf
+	return m, err
 }
 
 // Scan hands back up to count records at or after table:startKey in key
@@ -642,15 +662,31 @@ func (db *zu2DB) BatchInsert(ctx context.Context, table string, keys []string, v
 // read then a write. They are here because BatchDB is one interface and
 // the harness asserts against the whole of it.
 
+// BatchRead reads each key in turn. There is nothing to batch in the
+// engine, since every key is its own probe, but the rows still all come
+// back together, so each one needs a buffer and a map of its own. This
+// used to call Read in a loop, and once Read started handing back
+// storage the session reuses, that returned the same map len(keys) times
+// with the last row in it. Nothing in the sweeps goes through here, since
+// batch.size is set on the load and a load only inserts, but a read
+// workload run with batch.size does.
 func (db *zu2DB) BatchRead(ctx context.Context, table string, keys []string, fields []string) ([]map[string][]byte, error) {
-	out := make([]map[string][]byte, 0, len(keys))
-	for _, k := range keys {
-		row, err := db.Read(ctx, table, k, fields)
+	s := sessionOf(ctx)
+	for len(s.batchVals) < len(keys) {
+		s.batchRow = append(s.batchRow, nil)
+		s.batchVals = append(s.batchVals, make(map[string][]byte, 16))
+	}
+
+	out := s.batchOut[:0]
+	for i, k := range keys {
+		row, buf, err := db.readOne(s, table, k, fields, s.batchRow[i], s.batchVals[i])
+		s.batchRow[i] = buf
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, row)
 	}
+	s.batchOut = out
 	return out, nil
 }
 

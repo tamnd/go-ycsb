@@ -689,13 +689,63 @@ func (c *core) doBatchTransactionRead(ctx context.Context, batchSize int, db ycs
 		keys[i] = c.buildKeyName(c.nextKeyNum(state))
 	}
 
-	_, err := db.BatchRead(ctx, c.table, keys, fields)
+	rows, err := db.BatchRead(ctx, c.table, keys, fields)
 	if err != nil {
 		return err
 	}
 
-	// TODO should we verify the result?
+	if c.dataIntegrity {
+		c.verifyBatchRead(state, keys, rows)
+	}
 	return nil
+}
+
+// verifyBatchRead is verifyRow for a batch.
+//
+// Two checks, because either one alone lets something through. The
+// values are checked the way a scan's are, by reading the key back out
+// of the value it is in, which works whatever order the rows arrive in.
+// That alone is not enough: a driver that hands back the same row for
+// every key of the batch returns rows that are each perfectly valid, and
+// only where they sit gives it away. So when the driver returns one row
+// per key, which every driver in this comparison does, row i is also
+// required to be key i.
+//
+// mysql and tikv ask for the batch as one IN query with no order and
+// collapse duplicate keys, so they come back with a different count and
+// get the value check only. That is the most that can be said about a
+// result that does not claim to be positional.
+func (c *core) verifyBatchRead(state *coreState, keys []string, rows []map[string][]byte) {
+	positional := len(rows) == len(keys)
+	for i, values := range rows {
+		if len(values) == 0 {
+			util.Fatalf("batch read: row %d of %d came back with no fields at all", i, len(rows))
+		}
+
+		key := ""
+		for fieldKey, value := range values {
+			at := bytes.IndexByte(value, ':')
+			if at < 0 {
+				util.Fatalf("batch read: row %d field %s carries no key, got %q", i, fieldKey, value)
+			}
+			rowKey := string(value[:at])
+			if key == "" {
+				key = rowKey
+			} else if rowKey != key {
+				util.Fatalf("batch read: row %d mixes rows, field %s belongs to %s and the rest to %s",
+					i, fieldKey, rowKey, key)
+			}
+			expected := c.buildDeterministicValue(state, rowKey, fieldKey)
+			if !bytes.Equal(expected, value) {
+				util.Fatalf("batch read: row %d field %s, expect %q, but got %q",
+					i, fieldKey, expected, value)
+			}
+		}
+
+		if positional && key != keys[i] {
+			util.Fatalf("batch read: asked for %s at position %d and got %s", keys[i], i, key)
+		}
+	}
 }
 
 func (c *core) doBatchTransactionInsert(ctx context.Context, batchSize int, db ycsb.BatchDB, state *coreState) error {
