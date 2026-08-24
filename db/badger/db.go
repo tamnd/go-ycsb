@@ -222,6 +222,18 @@ func (db *badgerDB) Scan(ctx context.Context, table string, startKey string, cou
 }
 
 func (db *badgerDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+	// Taken here and released here, outside the closure, for the reason
+	// Insert gives: txn.Set keeps the slice rather than copying it and the
+	// commit happens after the closure returns, so releasing it inside is
+	// releasing a buffer badger has not finished with. The encode itself
+	// has to stay inside, because it needs the row the transaction read.
+	// The deferred Put reads this variable after Update has returned, so
+	// it hands back the grown buffer rather than the one Get produced.
+	buf := db.bufPool.Get()
+	defer func() {
+		db.bufPool.Put(buf)
+	}()
+
 	err := db.db.Update(func(txn *badger.Txn) error {
 		rowKey := db.getRowKey(table, key)
 		item, err := txn.Get(rowKey)
@@ -229,23 +241,22 @@ func (db *badgerDB) Update(ctx context.Context, table string, key string, values
 			return err
 		}
 
-		var data map[string][]byte
-		if err := item.Value(func(value []byte) error {
-			var err error
-			data, err = db.r.Decode(value, nil)
+		// ValueCopy rather than Value, because the map decoded here is
+		// read again below when it is encoded, which is outside the
+		// callback, and the decode sub-slices rather than copying. Same
+		// defect as Read had.
+		row, err := item.ValueCopy(nil)
+		if err != nil {
 			return err
-		}); err != nil {
+		}
+		data, err := db.r.Decode(row, nil)
+		if err != nil {
 			return err
 		}
 
 		for field, value := range values {
 			data[field] = value
 		}
-
-		buf := db.bufPool.Get()
-		defer func() {
-			db.bufPool.Put(buf)
-		}()
 
 		buf, err = db.r.Encode(buf, data)
 		if err != nil {
@@ -257,22 +268,34 @@ func (db *badgerDB) Update(ctx context.Context, table string, key string, values
 }
 
 func (db *badgerDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	err := db.db.Update(func(txn *badger.Txn) error {
-		rowKey := db.getRowKey(table, key)
+	// The encode buffer is released after the commit, not inside the
+	// closure. txn.Set does not copy the value, it keeps the slice until
+	// the transaction commits, and db.Update commits after the closure
+	// returns. So a deferred Put inside the closure, which is what this
+	// used to do, handed the buffer back to the pool while badger was
+	// still holding a pointer into it, another thread's Get took the same
+	// backing array (BufPool.Get only reslices to zero length) and its
+	// Encode appended over the top of a value that had not been written
+	// yet.
+	//
+	// This is not theoretical either. A load of thirty thousand records at
+	// sixteen threads, then workload e reading them back with
+	// dataintegrity on, reports a row that came back with no fields at
+	// all, on a store the run never wrote to. The load wrote it that way.
+	buf := db.bufPool.Get()
+	defer func() {
+		db.bufPool.Put(buf)
+	}()
 
-		buf := db.bufPool.Get()
-		defer func() {
-			db.bufPool.Put(buf)
-		}()
+	buf, err := db.r.Encode(buf, values)
+	if err != nil {
+		return err
+	}
 
-		buf, err := db.r.Encode(buf, values)
-		if err != nil {
-			return err
-		}
+	rowKey := db.getRowKey(table, key)
+	return db.db.Update(func(txn *badger.Txn) error {
 		return txn.Set(rowKey, buf)
 	})
-
-	return err
 }
 
 func (db *badgerDB) Delete(ctx context.Context, table string, key string) error {
