@@ -107,6 +107,43 @@ func (db DbWrapper) Scan(ctx context.Context, table string, startKey string, cou
 	return db.DB.Scan(ctx, table, startKey, count, fields)
 }
 
+// ScanEach is the ycsb.EachScanner path, timed as a SCAN like every
+// other operation here.
+//
+// It has to be on the wrapper and not only on the driver. The workload
+// holds a DbWrapper and nothing else, so a driver method this does not
+// forward is a driver method the workload cannot reach: ScanEach shipped
+// implemented on three drivers and was never once called, and the A/B
+// that was supposed to show what it was worth showed nothing because
+// both sides of it ran the same code.
+//
+// The wrapper satisfies the interface whether the driver does or not,
+// which is why the workload asks Unwrap first rather than asking this.
+// Reaching the fallback means the workload did not, and a fallback that
+// quietly rebuilt the rows out of maps would put work nobody asked for
+// inside the call being timed, which is the one thing this path exists
+// to take out.
+func (db DbWrapper) ScanEach(ctx context.Context, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) (err error) {
+	es, ok := db.DB.(ycsb.EachScanner)
+	if !ok {
+		return fmt.Errorf("%T does not implement ycsb.EachScanner", db.DB)
+	}
+
+	start := time.Now()
+	defer func() {
+		measure(ctx, start, "SCAN", err)
+	}()
+
+	return es.ScanEach(ctx, table, startKey, count, fields, fn)
+}
+
+// Unwrap is the driver underneath, for a caller asking whether it
+// implements an optional interface. Asking the wrapper answers yes to
+// everything the wrapper forwards, which is not the same question.
+func (db DbWrapper) Unwrap() ycsb.DB {
+	return db.DB
+}
+
 func (db DbWrapper) Update(ctx context.Context, table string, key string, values map[string][]byte) (err error) {
 	start := time.Now()
 	defer func() {

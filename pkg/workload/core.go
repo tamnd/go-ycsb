@@ -695,6 +695,27 @@ func (c *core) doTransactionInsert(ctx context.Context, db ycsb.DB, state *coreS
 	return db.Insert(ctx, c.table, dbKey, values)
 }
 
+// eachScanner answers whether this db really has the map free scan path,
+// and hands back the thing to call it on.
+//
+// Two questions, not one. The measurement wrapper implements ScanEach
+// whether the driver under it does or not, because a method it does not
+// forward is a method the workload cannot reach and cannot time. So the
+// capability is asked of the driver, through Unwrap, and the call is
+// made on the wrapper, so the scan is timed like every other one.
+func eachScanner(db ycsb.DB) (ycsb.EachScanner, bool) {
+	es, ok := db.(ycsb.EachScanner)
+	if !ok {
+		return nil, false
+	}
+	if w, ok := db.(interface{ Unwrap() ycsb.DB }); ok {
+		if _, has := w.Unwrap().(ycsb.EachScanner); !has {
+			return nil, false
+		}
+	}
+	return es, true
+}
+
 func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreState) error {
 	r := state.r
 	keyNum := c.nextKeyNum(state)
@@ -718,7 +739,7 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 	// dropped unread unless dataintegrity is on, and at 32 threads
 	// building them is at least 43 percent of what this call charges to
 	// the engine. See tamnd/zu#750.
-	if es, ok := db.(ycsb.EachScanner); ok && c.eachScan {
+	if es, ok := eachScanner(db); ok && c.eachScan {
 		rows := 0
 		last := ""
 		err := es.ScanEach(ctx, c.table, startKeyName, int(scanLen), fields,
