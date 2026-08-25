@@ -47,6 +47,46 @@ func BenchmarkDecodeRowMap(b *testing.B) {
 	}
 }
 
+// The pooled path, which is what the zu2 and lmdb drivers take: no map
+// allocation, the clear and the insertions only. The gap between this
+// and BenchmarkEachColumn below is what the map costs after pooling has
+// already taken the allocation out, and that is the number that says
+// whether handing columns back instead of a map is worth an interface
+// change.
+func BenchmarkDecodeInto(b *testing.B) {
+	r, row := benchRow(b)
+	into := make(map[string][]byte, 16)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := r.DecodeInto(row, nil, into); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// One scan's worth of it. Workload E asks for fifty rows on average and
+// the driver decodes every one of them inside the single Scan call the
+// harness times, so this is the shape that actually shows up in a
+// published latency: fifty rows through fifty pooled maps.
+func BenchmarkDecodeIntoScan(b *testing.B) {
+	const rows = 50
+	r, row := benchRow(b)
+	pool := make([]map[string][]byte, rows)
+	for i := range pool {
+		pool[i] = make(map[string][]byte, 16)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < rows; j++ {
+			if _, err := r.DecodeInto(row, nil, pool[j]); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
 func BenchmarkEachColumn(b *testing.B) {
 	_, row := benchRow(b)
 	b.ReportAllocs()
