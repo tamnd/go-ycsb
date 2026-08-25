@@ -152,6 +152,12 @@ const (
 	// forever. Off is the A/B, and the storage line says how many
 	// records promotion moved either way.
 	zu2Promote = "zu2.promote"
+	// Compress the values the cold tier takes. On, the way the engine
+	// has it: a record only reaches the tier by surviving a lap of the
+	// log unwritten, and reading it back is a pread of a device, so the
+	// decompress sits under a cost that is already there. Off is the
+	// A/B for the storage column, which is where the saving shows up.
+	zu2ColdCompression = "zu2.coldcompression"
 )
 
 type zu2Creator struct{}
@@ -285,6 +291,9 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 	if !p.GetBool(zu2Promote, true) {
 		opt.no_promote_reads = 1
+	}
+	if !p.GetBool(zu2ColdCompression, true) {
+		opt.no_cold_compression = 1
 	}
 	threads := p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault)
 	opt.sessions = C.uint64_t(p.GetInt64(zu2Sessions, threads+8))
@@ -937,6 +946,20 @@ func (db *zu2DB) printStorage() {
 		fmt.Printf("zu2 tier: cold %.1f MiB of %.1f MiB on disk (%.0f%%), span %.1f MiB, migrated %.1f MiB\n",
 			float64(cold)/mib, float64(disk)/mib, share,
 			float64(C.zu2_cold_span(db.db))/mib, float64(migrated)/mib)
+
+		// What the coder bought on this run's data, which is the only
+		// honest way to report it: a ratio measured on the values the
+		// tier actually took rather than one quoted from the coder's
+		// own corpus. Given is what the records were, stored is what
+		// went on the device for them, and records reclaimed since are
+		// in both, so this is a property of the workload and not of the
+		// moment the line is printed. tamnd/zu#725.
+		var given, stored C.uint64_t
+		if st := C.zu2_cold_value_bytes(db.db, &given, &stored); st == C.ZU2_OK && given > 0 {
+			fmt.Printf("zu2 tier coder: %.1f MiB of values stored in %.1f MiB, ratio %.4f\n",
+				float64(given)/mib, float64(stored)/mib,
+				float64(stored)/float64(given))
+		}
 	}
 
 	slots := buckets * 8
