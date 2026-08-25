@@ -404,14 +404,15 @@ func (db *sqliteDB) ScanEach(ctx context.Context, table string, startKey string,
 }
 
 func (db *sqliteDB) doScanEach(ctx context.Context, tx querier, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
-	eff := fields
-	if len(eff) == 0 {
-		eff = db.r.Fields()
+	var query string
+	if len(fields) == 0 {
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`, table)
+	} else {
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`,
+			strings.Join(fields, ","), table)
 	}
-	query := fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`,
-		strings.Join(eff, ","), table)
 	if db.verbose {
-		fmt.Printf("%s %v\n", query, []interface{}{startKey, count})
+		fmt.Printf("%s [%s %d]\n", query, startKey, count)
 	}
 
 	rows, err := tx.QueryContext(ctx, query, startKey, count)
@@ -420,11 +421,37 @@ func (db *sqliteDB) doScanEach(ctx context.Context, tx querier, table string, st
 	}
 	defer rows.Close()
 
-	values := make([][]byte, len(eff))
-	dest := make([]interface{}, len(eff))
-	for i := range dest {
-		dest[i] = &values[i]
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
 	}
+
+	// Where each column goes, or -1 for one that has no slot. Naming the
+	// fields makes this the identity; starring them also brings back
+	// YCSB_KEY, which is not a field and is dropped, so what the callback
+	// sees is the non key columns in table order either way.
+	slot := make([]int, len(cols))
+	n := 0
+	for i, c := range cols {
+		if len(fields) == 0 && c == "YCSB_KEY" {
+			slot[i] = -1
+			continue
+		}
+		slot[i] = n
+		n++
+	}
+
+	values := make([][]byte, n)
+	var skip []byte
+	dest := make([]interface{}, len(cols))
+	for i := range dest {
+		if slot[i] < 0 {
+			dest[i] = &skip
+			continue
+		}
+		dest[i] = &values[slot[i]]
+	}
+
 	for rows.Next() {
 		if err := rows.Scan(dest...); err != nil {
 			return err
@@ -433,10 +460,7 @@ func (db *sqliteDB) doScanEach(ctx context.Context, tx querier, table string, st
 			return err
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	return nil
+	return rows.Err()
 }
 
 func (db *sqliteDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
