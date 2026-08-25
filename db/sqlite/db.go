@@ -384,6 +384,13 @@ func (db *sqliteDB) doScan(ctx context.Context, tx querier, table string, startK
 // hands the callback the column values positionally in the order the
 // caller asked for them, which is the order the SELECT names them in.
 //
+// Refilling the dest slice is not enough on its own and this said it was
+// for a while. Scanning into a *[]byte has database/sql clone the
+// driver's bytes into a fresh slice whatever is already there, so the
+// per column allocation survived the rewrite that was meant to remove
+// it. sql.RawBytes is what actually removes it, and the body says why
+// that is allowed here.
+//
 // The columns are named rather than starred even when the caller asked
 // for every field. SELECT * also returns YCSB_KEY, which is not a field
 // and has no slot, so naming them keeps the row and the fields slice the
@@ -441,20 +448,40 @@ func (db *sqliteDB) doScanEach(ctx context.Context, tx querier, table string, st
 		n++
 	}
 
-	values := make([][]byte, n)
-	var skip []byte
+	// sql.RawBytes and not []byte, which is the difference between this
+	// path allocating nothing a row and allocating one buffer a column a
+	// row. Scanning into a *[]byte makes database/sql clone the driver's
+	// bytes into a fresh slice every time, whatever is already in the
+	// destination, so the dest slice was being reused and the thing it
+	// pointed at was not. Fifty rows of ten columns is five hundred
+	// allocations a scan that the map path was being blamed for.
+	//
+	// The contract is what makes this allowed. RawBytes is the driver's
+	// own memory and is good only until the next Next, Scan or Close on
+	// these rows, and ycsb.EachScanner says the values are good until the
+	// callback returns, which is strictly sooner. That is the same bargain
+	// the lmdb driver makes with its read transaction.
+	raws := make([]sql.RawBytes, n)
+	var skip sql.RawBytes
 	dest := make([]interface{}, len(cols))
 	for i := range dest {
 		if slot[i] < 0 {
 			dest[i] = &skip
 			continue
 		}
-		dest[i] = &values[slot[i]]
+		dest[i] = &raws[slot[i]]
 	}
 
+	// [][]byte and []sql.RawBytes are different types even though the
+	// element is the same memory, so the callback's view is built once
+	// and refilled with slice headers a row, which allocates nothing.
+	values := make([][]byte, n)
 	for rows.Next() {
 		if err := rows.Scan(dest...); err != nil {
 			return err
+		}
+		for i := range raws {
+			values[i] = raws[i]
 		}
 		if err := fn(values); err != nil {
 			return err
