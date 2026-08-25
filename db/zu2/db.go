@@ -161,6 +161,16 @@ const (
 	// decompress sits under a cost that is already there. Off is the
 	// A/B for the storage column, which is where the saving shows up.
 	zu2ColdCompression = "zu2.coldcompression"
+	// Hold a settled log page as a mapping of the file rather than as
+	// heap. Off, the way the engine has it, until the fault a mapped
+	// read takes has been measured against the load it replaces.
+	//
+	// This is the A/B for the memory column and it is not about the
+	// size of the resident set, it is about what kind of memory it is.
+	// On server2 at a million records zu2 held 1152.6 MiB of anonymous
+	// memory where lmdb held 17.6, and lmdb's resident set is page
+	// cache the kernel drops when it wants it back. tamnd/zu#757.
+	zu2MapSettled = "zu2.mapsettled"
 )
 
 type zu2Creator struct{}
@@ -308,6 +318,9 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 	if !p.GetBool(zu2ColdCompression, true) {
 		opt.no_cold_compression = 1
+	}
+	if p.GetBool(zu2MapSettled, false) {
+		opt.map_settled = 1
 	}
 	threads := p.GetInt64(prop.ThreadCount, prop.ThreadCountDefault)
 	opt.sessions = C.uint64_t(p.GetInt64(zu2Sessions, threads+8))
@@ -926,6 +939,7 @@ func (db *zu2DB) printStorage() {
 	grows := uint64(C.zu2_index_grows(db.db))
 	resizing := uint32(C.zu2_index_resizing(db.db))
 	resident := uint64(C.zu2_resident_pages(db.db))
+	mapped := uint64(C.zu2_mapped_pages(db.db))
 	discarded := uint64(C.zu2_discarded(db.db))
 
 	const mib = 1 << 20
@@ -933,6 +947,17 @@ func (db *zu2DB) printStorage() {
 	fmt.Printf("zu2 storage: disk %.1f MiB, log span %.1f MiB, written %.1f MiB, resident %.1f MiB (%d pages)\n",
 		float64(disk)/mib, float64(span)/mib, float64(written)/mib,
 		float64(resident*pageBytes)/mib, resident)
+
+	// The kind of the resident set, not its size. Anonymous pages are
+	// what the kernel can only swap and mapped pages are cache it can
+	// drop, so a peak rss that is mostly mapped means something quite
+	// different from one that is not. Printed only when there is a
+	// mapping to report, so every row taken with the option off reads
+	// the way it always did. tamnd/zu#757.
+	if mapped > 0 {
+		fmt.Printf("zu2 pages: %d of %d resident are mapped, %.1f MiB anonymous\n",
+			mapped, resident, float64((resident-mapped)*pageBytes)/mib)
+	}
 
 	// The tier's share of that disk number, which is the context every
 	// row measured with the tier on needs (tamnd/zu#600). How much of a
