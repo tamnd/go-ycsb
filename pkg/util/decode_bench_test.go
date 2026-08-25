@@ -87,6 +87,54 @@ func BenchmarkDecodeIntoScan(b *testing.B) {
 	}
 }
 
+// The same fifty rows on every core at once, which is the state the
+// published numbers are taken in. A pooled decode allocates nothing, so
+// what changes between here and the serial version is contention for
+// cache and for memory bandwidth, and that is not a small correction on
+// a workload whose whole cost is touching a row it just read.
+func BenchmarkDecodeIntoScanParallel(b *testing.B) {
+	const rows = 50
+	r, row := benchRow(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		pool := make([]map[string][]byte, rows)
+		for i := range pool {
+			pool[i] = make(map[string][]byte, 16)
+		}
+		for pb.Next() {
+			for j := 0; j < rows; j++ {
+				if _, err := r.DecodeInto(row, nil, pool[j]); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+	})
+}
+
+// The floor under the one above: the same fifty rows on every core with
+// the map taken out. Whatever separates the two is what the harness
+// could stop paying if a driver handed columns back instead of a map.
+func BenchmarkEachColumnScanParallel(b *testing.B) {
+	const rows = 50
+	_, row := benchRow(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		n := 0
+		for pb.Next() {
+			for j := 0; j < rows; j++ {
+				if err := EachColumn(row, func(int64, []byte) { n++ }); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+		if n == 0 {
+			b.Error("the walk found no columns")
+		}
+	})
+}
+
 func BenchmarkEachColumn(b *testing.B) {
 	_, row := benchRow(b)
 	b.ReportAllocs()
