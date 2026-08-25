@@ -72,6 +72,19 @@ OUT="${OUT:-$WORK/$ENGINE-r$RECORDS-t$THREADS.tsv}"
 # it measures is the load path rather than the engine: zu2's batch entry
 # point waits for the device once for the batch instead of once a record,
 # which is the wait a loader did not ask for. See tamnd/zu#377.
+# Operations the run phase does, which defaults to the record count and
+# is separate from it on purpose.
+#
+# A sweep that asks whether latency is flat as the database grows has to
+# vary one thing, the size of the database. Tied together, a run at 1e7
+# does a thousand times the operations of one at 1e4, so it also runs a
+# thousand times longer, drifts a thousand times further into whatever
+# else the host is doing, and its percentiles are taken over a different
+# number of samples. Pinned, every point in the curve does the same work
+# against a different amount of data, which is the question. Y1 and the
+# first box of Y3, tamnd/zu#374 and tamnd/zu#376.
+OPS="${OPS:-$RECORDS}"
+
 BATCH="${BATCH:-1}"
 BATCH_ARGS=()
 [ "$BATCH" -gt 1 ] && BATCH_ARGS=(-p "batch.size=$BATCH")
@@ -277,6 +290,7 @@ fi
   echo "# cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu)"
   echo "# loadavg at start: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
   echo "# records: $RECORDS threads: $THREADS batch: $BATCH"
+  [ "$OPS" != "$RECORDS" ] && echo "# operations: $OPS, pinned rather than following the record count"
   [ -n "${YCSB_EXTRA:-}" ] && echo "# extra: $YCSB_EXTRA"
   [ -z "$TIME_BIN" ] && echo "# no /usr/bin/time -v here, so there is no memory column in this file"
   echo "# git: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -891,7 +905,7 @@ for w in ${WORKLOADS:-a b c d e f}; do
   rows "$w" load "$raw"
 
   raw=$(timed "$BIN" run "$ENGINE" -P "workloads/workload$w" "${ENGINE_ARGS[@]+"${ENGINE_ARGS[@]}"}" "${EXTRA[@]+"${EXTRA[@]}"}" \
-    -p recordcount="$RECORDS" -p operationcount="$RECORDS" \
+    -p recordcount="$RECORDS" -p operationcount="$OPS" \
     -p threadcount="$THREADS" 2>&1)
   run_out=$(grep -E '^(READ|UPDATE|INSERT|SCAN|READ_MODIFY_WRITE|TOTAL) ' <<<"$raw")
   # The same courtesy the load phase gets. A run that produced nothing
