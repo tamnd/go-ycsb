@@ -3,6 +3,7 @@ package util
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/magiconair/properties"
@@ -120,6 +121,11 @@ func BenchmarkEachColumnScanParallel(b *testing.B) {
 	_, row := benchRow(b)
 	b.ReportAllocs()
 	b.ResetTimer()
+	// Summed across workers rather than checked inside one: RunParallel
+	// starts a worker a core and hands the iterations out, so a worker
+	// can finish having run none of them and a check in there fails on a
+	// benchmark that worked.
+	var seen atomic.Int64
 	b.RunParallel(func(pb *testing.PB) {
 		n := 0
 		for pb.Next() {
@@ -129,10 +135,11 @@ func BenchmarkEachColumnScanParallel(b *testing.B) {
 				}
 			}
 		}
-		if n == 0 {
-			b.Error("the walk found no columns")
-		}
+		seen.Add(int64(n))
 	})
+	if seen.Load() == 0 {
+		b.Fatal("the walk found no columns")
+	}
 }
 
 func BenchmarkEachColumn(b *testing.B) {
