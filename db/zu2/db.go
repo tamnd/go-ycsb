@@ -940,6 +940,7 @@ func (db *zu2DB) printStorage() {
 	resizing := uint32(C.zu2_index_resizing(db.db))
 	resident := uint64(C.zu2_resident_pages(db.db))
 	mapped := uint64(C.zu2_mapped_pages(db.db))
+	anonymous := uint64(C.zu2_anonymous_pages(db.db))
 	discarded := uint64(C.zu2_discarded(db.db))
 
 	const mib = 1 << 20
@@ -955,20 +956,15 @@ func (db *zu2DB) printStorage() {
 	// mapping to report, so every row taken with the option off reads
 	// the way it always did. tamnd/zu#757.
 	//
-	// The two counters are read one after the other and the maintainer
-	// does not stop while that happens, so mapped can come back larger
-	// than the resident count captured a moment earlier. These are
-	// uint64, and the subtraction underflows into something like 1.8e13
-	// MiB, which is the kind of number that reads as a broken engine
-	// rather than as a racing report line. Clamped, and the row says
-	// what it did rather than quietly printing a smaller gap.
-	if mapped > resident {
-		fmt.Printf("zu2 pages: %d mapped against %d resident, "+
-			"the two counters were read a moment apart, anonymous 0.0 MiB\n",
-			mapped, resident)
-	} else if mapped > 0 {
+	// The anonymous figure is asked for rather than worked out as
+	// resident minus mapped. The two page table walks are taken a moment
+	// apart while the maintainer keeps converting pages, so their
+	// difference can go negative, and in uint64 that printed as 1.8e13
+	// MiB: a racing report line that read as a broken engine. The engine
+	// keeps the count itself now. tamnd/zu#757, tamnd/zu#759.
+	if mapped > 0 {
 		fmt.Printf("zu2 pages: %d of %d resident are mapped, %.1f MiB anonymous\n",
-			mapped, resident, float64((resident-mapped)*pageBytes)/mib)
+			mapped, resident, float64(anonymous*pageBytes)/mib)
 	}
 
 	// The tier's share of that disk number, which is the context every
