@@ -37,7 +37,10 @@
 // reads. The plane is off unless zu2.ordered says otherwise, because it
 // is memory a workload that never scans should not be paying for, and a
 // scan against a database opened without it is an error rather than an
-// empty answer.
+// empty answer. The plane is rebuilt from the log at open, so the flag is
+// about the process doing the scanning and not about the process that
+// wrote the records, and a run whose workload scans without it refuses to
+// start rather than failing every scan.
 //
 // The graph plane is not exercised here either. YCSB core has no
 // traversal in it, and the traversal comparison lives in
@@ -251,6 +254,17 @@ func (zu2Creator) Create(p *properties.Properties) (ycsb.DB, error) {
 		d.durability = C.ZU2_DURABLE
 	default:
 		return nil, fmt.Errorf("zu2: %s must be async or durable", zu2Durability)
+	}
+
+	// A workload that scans against a store opened without the plane
+	// fails every scan, and a summary of nothing but SCAN_ERROR reads
+	// like an engine that cannot scan rather than a flag that was not
+	// set. It cost two hours once, so the run does not start. tamnd/zu#730.
+	if p.GetFloat64(prop.ScanProportion, prop.ScanProportionDefault) > 0 &&
+		!p.GetBool(zu2Ordered, false) {
+		return nil, fmt.Errorf("zu2: this workload scans and %s is not set, "+
+			"so the store would open without a scan plane and every scan "+
+			"would fail", zu2Ordered)
 	}
 
 	if p.GetBool(prop.DropData, prop.DropDataDefault) {
