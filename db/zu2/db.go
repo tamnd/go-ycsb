@@ -164,6 +164,12 @@ type session struct {
 	s *C.zu2_session
 	// Row key scratch, so building table:key costs no allocation.
 	key []byte
+	// And the same for the table prefix a scan tests every row against.
+	// Separate from `key` on purpose: a scan holds the seek key while it
+	// walks and tests the prefix a row, so one buffer for both would have
+	// the second write eat the first. That is the aliasing the lmdb driver
+	// keeps `s.prefix` and `s.key` apart to avoid.
+	prefix []byte
 	// Row value scratch for the encoder.
 	buf []byte
 	// Where the batch path stages, kept per session so a load of a
@@ -345,6 +351,17 @@ func (s *session) rowKey(table, key string) []byte {
 	s.key = append(s.key, ':')
 	s.key = append(s.key, key...)
 	return s.key
+}
+
+// tablePrefix is what every row a scan walks has to start with, in the
+// session's own buffer so the check costs no allocation. Both scan paths
+// were building this with []byte(table + ":") a call, which is a string
+// concatenation and a conversion, so two allocations an operation on the
+// path whose whole point is not to have any.
+func (s *session) tablePrefix(table string) []byte {
+	s.prefix = append(s.prefix[:0], table...)
+	s.prefix = append(s.prefix, ':')
+	return s.prefix
 }
 
 // ptr hands C the start of a Go slice. libzu2 copies what it is given
@@ -557,7 +574,7 @@ func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count 
 	// kilobytes of memcpy a scan, and workload e is nothing but scans.
 	all := unsafe.Slice(pairs, int(returned))
 
-	prefix := []byte(table + ":")
+	prefix := s.tablePrefix(table)
 	got := s.scanRows[:0]
 	for _, pair := range all {
 		key := unsafe.Slice((*byte)(unsafe.Pointer(pair.key)), int(pair.key_len))
@@ -629,7 +646,7 @@ func (db *zu2DB) ScanEach(ctx context.Context, table string, startKey string, co
 		s.eachVals = make([][]byte, n)
 	}
 
-	prefix := []byte(table + ":")
+	prefix := s.tablePrefix(table)
 	for _, pair := range unsafe.Slice(pairs, int(returned)) {
 		key := unsafe.Slice((*byte)(unsafe.Pointer(pair.key)), int(pair.key_len))
 		if !bytes.HasPrefix(key, prefix) {

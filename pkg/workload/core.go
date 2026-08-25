@@ -739,6 +739,22 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 	// dropped unread unless dataintegrity is on, and at 32 threads
 	// building them is at least 43 percent of what this call charges to
 	// the engine. See tamnd/zu#750.
+	// One thing to know before comparing the two paths' latencies on a
+	// dataintegrity run, and only on one. Verification happens inside the
+	// callback here because the values are the engine's own memory and are
+	// over when the callback returns, and the callback is inside the call
+	// the wrapper is timing. Down in the map path verifyScan runs after
+	// Scan has returned and the timer has stopped. So with dataintegrity
+	// on, this path's SCAN latency carries the checking and the other
+	// path's does not: ten thousand records of workload E on zu2 reports
+	// 349 us a scan here against 29 there, and none of that gap is the
+	// engine. Throughput is unaffected either way, since the work happens
+	// inside the operation whichever side of the timer it lands on.
+	//
+	// Left as it is rather than plumbed around, because dataintegrity is
+	// the correctness gate and no published number comes from a run with
+	// it on. bench-engine.sh keeps the gate's output to itself and prints
+	// a verdict, so these latencies do not reach a table. tamnd/zu#750.
 	if es, ok := eachScanner(db); ok && c.eachScan {
 		rows := 0
 		last := ""
