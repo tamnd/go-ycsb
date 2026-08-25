@@ -123,3 +123,116 @@ func TestDecodeIntoMatchesDecode(t *testing.T) {
 		}
 	}
 }
+
+// The map free decode, against the map one. DecodeEach is only worth
+// having if it answers exactly what DecodeInto answers, so the check is
+// that they agree, over field sets that are shuffled, short, and asking
+// for something that is not there.
+func TestDecodeEachAgreesWithDecodeInto(t *testing.T) {
+	p := properties.NewProperties()
+	p.Set(prop.FieldCount, "10")
+	r := NewRowCodec(p)
+
+	values := make(map[string][]byte, 10)
+	for i := 0; i < 10; i++ {
+		values[fmt.Sprintf("field%d", i)] = []byte(fmt.Sprintf("value-%d", i))
+	}
+	row, err := r.Encode(nil, values)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	cases := [][]string{
+		nil,
+		{"field0"},
+		{"field9", "field0"},
+		{"field3", "field1", "field7", "field0"},
+		// Every field, in an order that is not column order. The fast
+		// path a decode is tempted to take is "all the fields means the
+		// columns land where they already are", and this is the case
+		// that catches it.
+		{"field9", "field8", "field7", "field6", "field5", "field4", "field3", "field2", "field1", "field0"},
+		// A name no column carries. It takes a slot and the slot stays
+		// nil, rather than shifting everything after it.
+		{"field2", "nosuchfield", "field5"},
+	}
+
+	for _, fields := range cases {
+		want, err := r.DecodeInto(row, fields, nil)
+		if err != nil {
+			t.Fatalf("%v: DecodeInto: %v", fields, err)
+		}
+
+		eff := fields
+		if len(eff) == 0 {
+			eff = r.Fields()
+		}
+		pos := r.Positions(fields, nil)
+		got, err := r.DecodeEach(row, pos, make([][]byte, len(eff)))
+		if err != nil {
+			t.Fatalf("%v: DecodeEach: %v", fields, err)
+		}
+
+		if len(got) != len(eff) {
+			t.Fatalf("%v: got %d slots, want %d", fields, len(got), len(eff))
+		}
+		found := 0
+		for i, name := range eff {
+			w, ok := want[name]
+			if !ok {
+				if got[i] != nil {
+					t.Errorf("%v: slot %d (%s) holds %q, but the map path has no such field",
+						fields, i, name, got[i])
+				}
+				continue
+			}
+			found++
+			if !bytes.Equal(got[i], w) {
+				t.Errorf("%v: slot %d (%s) is %q, want %q", fields, i, name, got[i], w)
+			}
+		}
+		if found != len(want) {
+			t.Errorf("%v: the map path found %d fields and the slots account for %d",
+				fields, len(want), found)
+		}
+	}
+}
+
+// The slots are reused across rows, so a field missing from the second
+// row has to come back nil rather than as whatever the first row left
+// there.
+func TestDecodeEachClearsBetweenRows(t *testing.T) {
+	p := properties.NewProperties()
+	p.Set(prop.FieldCount, "4")
+	r := NewRowCodec(p)
+
+	full, err := r.Encode(nil, map[string][]byte{
+		"field0": []byte("a"), "field1": []byte("b"),
+		"field2": []byte("c"), "field3": []byte("d"),
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	partial, err := r.Encode(nil, map[string][]byte{"field0": []byte("z")})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	pos := r.Positions(nil, nil)
+	into := make([][]byte, 4)
+	if _, err := r.DecodeEach(full, pos, into); err != nil {
+		t.Fatalf("first row: %v", err)
+	}
+	got, err := r.DecodeEach(partial, pos, into)
+	if err != nil {
+		t.Fatalf("second row: %v", err)
+	}
+	if !bytes.Equal(got[0], []byte("z")) {
+		t.Errorf("field0 is %q, want %q", got[0], "z")
+	}
+	for i := 1; i < 4; i++ {
+		if got[i] != nil {
+			t.Errorf("field%d is %q, and the second row has no such field", i, got[i])
+		}
+	}
+}

@@ -380,6 +380,61 @@ func (c *core) verifyScan(state *coreState, startKey string, rows []map[string][
 	}
 }
 
+// verifyScanRow is verifyScan for one row of a scan taken through
+// EachScanner, where the rows arrive one at a time and there is no slice
+// to walk at the end.
+//
+// It checks the same three things: that the row has fields at all, that
+// every field of it names the same key and carries the value that key and
+// field are supposed to have, and that the keys climb from the start key.
+// `last` carries the previous row's key across calls, which is the only
+// state the slice version kept.
+func (c *core) verifyScanRow(state *coreState, startKey string, i int, fields []string, values [][]byte, last *string) {
+	found := 0
+	key := ""
+	for at, value := range values {
+		if value == nil {
+			continue
+		}
+		found++
+		fieldKey := fields[at]
+		sep := bytes.IndexByte(value, ':')
+		if sep < 0 {
+			util.Fatalf("scan from %s: row %d field %s carries no key, got %q",
+				startKey, i, fieldKey, value)
+		}
+		rowKey := string(value[:sep])
+		// Every field of one row has to name the same key. A driver
+		// filling one slice from a buffer it reuses would leak a field
+		// of the row before into this one, and this is what that looks
+		// like.
+		if key == "" {
+			key = rowKey
+		} else if rowKey != key {
+			util.Fatalf("scan from %s: row %d mixes rows, field %s belongs to %s and the rest to %s",
+				startKey, i, fieldKey, rowKey, key)
+		}
+		expected := c.buildDeterministicValue(state, rowKey, fieldKey)
+		if !bytes.Equal(expected, value) {
+			util.Fatalf("scan from %s: row %d field %s, expect %q, but got %q",
+				startKey, i, fieldKey, expected, value)
+		}
+	}
+
+	if found == 0 {
+		util.Fatalf("scan from %s: row %d came back with no fields at all", startKey, i)
+	}
+
+	if key < startKey {
+		util.Fatalf("scan from %s: row %d is key %s, which is before the start",
+			startKey, i, key)
+	}
+	if *last != "" && key <= *last {
+		util.Fatalf("scan from %s: keys do not climb, %s then %s", startKey, *last, key)
+	}
+	*last = key
+}
+
 func (c *core) verifyRow(state *coreState, key string, values map[string][]byte) {
 	// An empty row is the failure this check exists to catch, not a
 	// case to skip. An engine that stored the key and dropped the
@@ -654,9 +709,30 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 		fields = state.fieldNames
 	}
 
-	rows, err := db.Scan(ctx, c.table, startKeyName, int(scanLen), fields)
 	c.scans.Add(1)
 	c.scanAsked.Add(int64(scanLen))
+
+	// The driver that can hand columns back without building a map a row
+	// gets to. A scan returns fifty rows on average and the maps are
+	// dropped unread unless dataintegrity is on, and at 32 threads
+	// building them is at least 43 percent of what this call charges to
+	// the engine. See tamnd/zu#750.
+	if es, ok := db.(ycsb.EachScanner); ok {
+		rows := 0
+		last := ""
+		err := es.ScanEach(ctx, c.table, startKeyName, int(scanLen), fields,
+			func(values [][]byte) error {
+				if c.dataIntegrity {
+					c.verifyScanRow(state, startKeyName, rows, fields, values, &last)
+				}
+				rows++
+				return nil
+			})
+		c.scanRows.Add(int64(rows))
+		return err
+	}
+
+	rows, err := db.Scan(ctx, c.table, startKeyName, int(scanLen), fields)
 	c.scanRows.Add(int64(len(rows)))
 
 	if err == nil && c.dataIntegrity {

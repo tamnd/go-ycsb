@@ -133,6 +133,71 @@ func (r *RowCodec) DecodeInto(row []byte, fields []string, into map[string][]byt
 	return res, nil
 }
 
+// Fields is the full field list in column order, which is what an empty
+// fields slice means everywhere else here. A driver that has to name its
+// columns rather than ask for all of them needs the list itself.
+func (r *RowCodec) Fields() []string {
+	return r.fields
+}
+
+// Positions maps a column id to where that column belongs in a fields
+// slice, or to -1 when the fields slice does not ask for it.
+//
+// Built once for a connection and handed to DecodeEach on every row,
+// which is what keeps DecodeEach free of both a map and any string work.
+// Doing the same job inside the decode would mean either comparing field
+// names a column a row, or assuming a full fields slice arrives in column
+// order, and the second is true of this workload today and is not
+// something a decode should quietly depend on.
+//
+// An empty fields slice means every field, the same as elsewhere here.
+// `into` is grown or reused.
+func (r *RowCodec) Positions(fields []string, into []int) []int {
+	if len(fields) == 0 {
+		fields = r.fields
+	}
+	if cap(into) < len(r.fieldNames) {
+		into = make([]int, len(r.fieldNames))
+	}
+	into = into[:len(r.fieldNames)]
+	for i := range into {
+		into[i] = -1
+	}
+	for i, f := range fields {
+		if id, ok := r.fieldIndices[f]; ok {
+			into[id] = i
+		}
+	}
+	return into
+}
+
+// DecodeEach is Decode with no map in it: the row is walked and each
+// wanted column is dropped into the slot Positions gave it.
+//
+// `into` is the caller's, is sized to the fields slice the positions were
+// built from, and comes back holding one entry a field with nil where the
+// row carried no such column. The values point into `row` rather than
+// into a copy of it, the same as DecodeInto.
+//
+// A pooled DecodeInto is 166 ns a row where this is 77, ten fields of a
+// hundred bytes on an i9-13900K, and a scan decodes fifty rows inside the
+// call the harness times. See tamnd/zu#750.
+func (r *RowCodec) DecodeEach(row []byte, positions []int, into [][]byte) ([][]byte, error) {
+	clear(into)
+	err := EachColumn(row, func(id int64, value []byte) {
+		if id < 0 || int(id) >= len(positions) {
+			return
+		}
+		if p := positions[id]; p >= 0 && p < len(into) {
+			into[p] = value
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return into, nil
+}
+
 // Encode encodes the values
 func (r *RowCodec) Encode(buf []byte, values map[string][]byte) ([]byte, error) {
 	cols := make([][]byte, 0, len(values))

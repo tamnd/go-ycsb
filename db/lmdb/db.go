@@ -92,6 +92,96 @@ type lmdbState struct {
 	scanOff  []int
 	scanVals []map[string][]byte
 	scanRows []map[string][]byte
+
+	// The map free scan path. One row is live at a time there, so there
+	// is no second pass and no copy: the callback sees the row while the
+	// cursor is still on it and inside the read transaction, and the row
+	// is over when the callback returns. `eachFields` is what `eachPos`
+	// was built from, kept so the positions cost one pass a session
+	// rather than one a row.
+	eachPos    []int
+	eachVals   [][]byte
+	eachFields []string
+}
+
+// ScanEach is Scan with the maps taken out, the ycsb.EachScanner path.
+//
+// Two things go away against Scan. The maps do, one a row, which is 89 ns
+// of the 166 a pooled decode costs. So does the copy: Scan has to move
+// every row it will return into a buffer of its own because lmdb's values
+// live only as long as the read transaction and the transaction ends when
+// View returns, whereas here the callback runs inside it and the value is
+// still the one lmdb is pointing at. Fifty rows of a kilobyte is fifty
+// kilobytes of memcpy a scan that nobody needed.
+//
+// So the values are lmdb's own pages and are good until the callback
+// returns and no longer. See tamnd/zu#750.
+func (db *lmdbDB) ScanEach(ctx context.Context, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
+	if count <= 0 {
+		return nil
+	}
+	s := db.state(ctx)
+	prefix := s.tablePrefix(table)
+
+	// The nil check is not redundant: an empty fields slice means every
+	// field and matches the empty slice a fresh session starts with.
+	if s.eachVals == nil || !sameFields(s.eachFields, fields) {
+		s.eachPos = db.r.Positions(fields, s.eachPos)
+		s.eachFields = append(s.eachFields[:0], fields...)
+		n := len(fields)
+		if n == 0 {
+			n = len(s.eachPos)
+		}
+		s.eachVals = make([][]byte, n)
+	}
+
+	return db.env.View(func(txn *lmdb.Txn) error {
+		txn.RawRead = true
+		cur, err := txn.OpenCursor(db.dbi)
+		if err != nil {
+			return err
+		}
+		defer cur.Close()
+
+		seen := 0
+		op := uint(lmdb.SetRange)
+		for k, v, err := cur.Get(s.rowKey(table, startKey), nil, op); ; k, v, err = cur.Get(nil, nil, lmdb.Next) {
+			if lmdb.IsNotFound(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if !bytes.HasPrefix(k, prefix) {
+				return nil
+			}
+			values, err := db.r.DecodeEach(v, s.eachPos, s.eachVals)
+			if err != nil {
+				return err
+			}
+			if err := fn(values); err != nil {
+				return err
+			}
+			seen++
+			if seen >= count {
+				return nil
+			}
+		}
+	})
+}
+
+// sameFields is equality on the two slices without allocating, which is
+// all the positions cache needs to know.
+func sameFields(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *lmdbState) rowKey(table, key string) []byte {

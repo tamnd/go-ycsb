@@ -95,6 +95,37 @@ type BatchDB interface {
 	BatchDelete(ctx context.Context, table string, keys []string) error
 }
 
+// EachScanner is Scan without the maps, for a DB that can do it.
+//
+// Scan returns a map a row and a scan returns fifty rows on average, so a
+// driver builds fifty maps inside the call the harness times and charges
+// all of it to the database. The workload then asks the result for its
+// length and, only under dataintegrity, for its fields, so in the
+// measured path the maps are built and dropped without being read.
+// Measured at 32 threads that is at least 43 percent of what workload E
+// charges to the engine.
+//
+// Values comes back aligned to the fields slice the caller passed in, one
+// entry a field, nil where the row had no such column. It belongs to the
+// driver and is good until the callback returns, which is the same
+// promise a driver already makes about a value pointing into a buffer it
+// reuses. A callback that wants to keep a value copies it.
+//
+// The shape is positional rather than the raw encoded row on purpose. An
+// interface handing the encoding back would be free for an engine that
+// stores the row as one opaque blob and would cost an engine that stores
+// columns the work of building an encoding nobody wanted, which measures
+// the storage format instead of the engine. Columns are the natural shape
+// on both sides: zu2 and lmdb walk their encoding into a slice they keep,
+// and sqlite, pg and mongodb read their columns out positionally and
+// never build the encoding at all.
+//
+// Returning an error from fn stops the scan and comes back out of
+// ScanEach unchanged.
+type EachScanner interface {
+	ScanEach(ctx context.Context, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error
+}
+
 // AnalyzeDB is the interface for the DB that can perform an analysis on given table.
 type AnalyzeDB interface {
 	// Analyze performs a key distribution analysis for the table.

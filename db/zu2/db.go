@@ -188,6 +188,15 @@ type session struct {
 	// has moved on, which is the lifetime the C API states.
 	scanVals []map[string][]byte
 	scanRows []map[string][]byte
+	// The map free scan path. One row is live at a time there, because
+	// the caller sees each row inside a callback and the row is over when
+	// the callback returns, so one slice a session is enough where the
+	// map path needs one a row. `eachFields` is what `eachPos` was built
+	// from, kept so the positions are computed once a session and not
+	// once a row.
+	eachPos    []int
+	eachVals   [][]byte
+	eachFields []string
 	// And once more for a batch read, which is the same problem again:
 	// every row of the batch comes back at once, so each key needs its
 	// own buffer and its own map or they all end up holding the last
@@ -571,6 +580,85 @@ func (db *zu2DB) Scan(ctx context.Context, table string, startKey string, count 
 	}
 	s.scanRows = got
 	return got, nil
+}
+
+// ScanEach is Scan with the maps taken out, the ycsb.EachScanner path.
+//
+// Same engine call and same borrowed scan buffer as Scan, and the only
+// difference is what is built on top: one slice of column values that the
+// session keeps, refilled a row and handed to the callback, instead of a
+// map a row. A pooled map decode is 166 ns a row against 77 for the bare
+// parse and a scan decodes fifty of them inside the call the harness
+// times, so this is the larger half of workload E's driver cost. See
+// tamnd/zu#750.
+//
+// The values point into the engine's scan buffer, so they are good until
+// the callback returns and no longer, which is stricter than what Scan
+// promises and is what lets one slice do the work of fifty maps.
+func (db *zu2DB) ScanEach(ctx context.Context, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
+	if count <= 0 {
+		return nil
+	}
+	s := sessionOf(ctx)
+	rk := s.rowKey(table, startKey)
+
+	var pairs *C.zu2_pair
+	var returned C.size_t
+	st := C.zu2_scan(s.s, ptr(rk), C.size_t(len(rk)), C.size_t(count), &pairs, &returned)
+	if st != C.ZU2_OK {
+		return sessionErr(s.s, st, fmt.Sprintf("zu2: scan from %q failed", startKey))
+	}
+	if returned == 0 || pairs == nil {
+		return nil
+	}
+
+	// The field set is fixed for the length of a run, so the positions
+	// are built on the first scan of a session and then only when the
+	// caller changes its mind.
+	// The nil check is not redundant: an empty fields slice means every
+	// field, and an empty one matches the empty slice a fresh session
+	// starts with, so without it the first scan of a run that asks for
+	// every field would find a cache that was never filled.
+	if s.eachVals == nil || !sameFields(s.eachFields, fields) {
+		s.eachPos = db.r.Positions(fields, s.eachPos)
+		s.eachFields = append(s.eachFields[:0], fields...)
+		n := len(fields)
+		if n == 0 {
+			n = len(s.eachPos)
+		}
+		s.eachVals = make([][]byte, n)
+	}
+
+	prefix := []byte(table + ":")
+	for _, pair := range unsafe.Slice(pairs, int(returned)) {
+		key := unsafe.Slice((*byte)(unsafe.Pointer(pair.key)), int(pair.key_len))
+		if !bytes.HasPrefix(key, prefix) {
+			break
+		}
+		row := unsafe.Slice((*byte)(unsafe.Pointer(pair.value)), int(pair.value_len))
+		values, err := db.r.DecodeEach(row, s.eachPos, s.eachVals)
+		if err != nil {
+			return err
+		}
+		if err := fn(values); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sameFields is equality on the two slices without allocating, which is
+// all the positions cache needs to know.
+func sameFields(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (db *zu2DB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {

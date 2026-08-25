@@ -376,6 +376,69 @@ func (db *sqliteDB) doScan(ctx context.Context, tx querier, table string, startK
 	return rows, err
 }
 
+// ScanEach is Scan with the maps taken out, the ycsb.EachScanner path.
+//
+// The map path here is the most wasteful of any driver in the tree: a
+// map, a dest slice and a fresh []byte a column, all allocated a row, and
+// a scan is fifty rows. This keeps one of each and refills them, and
+// hands the callback the column values positionally in the order the
+// caller asked for them, which is the order the SELECT names them in.
+//
+// The columns are named rather than starred even when the caller asked
+// for every field. SELECT * also returns YCSB_KEY, which is not a field
+// and has no slot, so naming them keeps the row and the fields slice the
+// same shape and stops sqlite reading a column nobody wanted.
+//
+// The values are the driver's own and are good until the callback
+// returns. See tamnd/zu#750.
+func (db *sqliteDB) ScanEach(ctx context.Context, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
+	if count <= 0 {
+		return nil
+	}
+	if !db.readTx {
+		return db.doScanEach(ctx, db.db, table, startKey, count, fields, fn)
+	}
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		return db.doScanEach(ctx, tx, table, startKey, count, fields, fn)
+	})
+}
+
+func (db *sqliteDB) doScanEach(ctx context.Context, tx querier, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
+	eff := fields
+	if len(eff) == 0 {
+		eff = db.r.Fields()
+	}
+	query := fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`,
+		strings.Join(eff, ","), table)
+	if db.verbose {
+		fmt.Printf("%s %v\n", query, []interface{}{startKey, count})
+	}
+
+	rows, err := tx.QueryContext(ctx, query, startKey, count)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	values := make([][]byte, len(eff))
+	dest := make([]interface{}, len(eff))
+	for i := range dest {
+		dest[i] = &values[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return err
+		}
+		if err := fn(values); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (db *sqliteDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
 	if !db.readTx {
 		return db.doScan(ctx, db.db, table, startKey, count, fields)
