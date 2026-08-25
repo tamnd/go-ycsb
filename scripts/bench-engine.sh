@@ -644,6 +644,17 @@ maxrss() {  # maxrss <workload> <phase> <output>
          if (kb > pss * 1.5)
            printf "# %s %s: %s rss is %.1fx its pss, so it maps something more than once, see tamnd/zu#695\n", \
              w, p, e, kb / pss
+         # And the warning that matters more than the double counting
+         # one. A resident set that is mostly page cache is not a
+         # property of the engine, it is a measure of how much room the
+         # kernel had on this host in these minutes. Measured: two lmdb
+         # loads of the same million records on server2, forty minutes
+         # apart, gave 838.2 and 1640.5 MiB of peak rss while their
+         # anonymous figures were 17.6 and 17.2. Quoting either rss
+         # without saying this invites a comparison that does not hold.
+         if (pss > 0 && anon < pss * 0.25)
+           printf "# %s %s: %s is %.0f%% page cache, so this rss is a fact about the host and not about %s, quote the anonymous figure, see tamnd/zu#695\n", \
+             w, p, e, (pss - anon) * 100 / pss, e
        }' | tee -a "$OUT"
   elif [ ! -r /proc/self/smaps_rollup ]; then
     echo "# $1 $2: no smaps_rollup on this host, so the memory figure is rss and over counts shared mappings" \
