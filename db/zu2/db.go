@@ -967,6 +967,18 @@ func (db *zu2DB) printStorage() {
 			mapped, resident, float64(anonymous*pageBytes)/mib)
 	}
 
+	// A refusal is not an error and it is not nothing either. It means
+	// map_settled asked the kernel for a mapping and did not get one,
+	// which is what a process at vm.max_map_count looks like, and a
+	// mapped arm of an A/B that reports refusals is measuring something
+	// other than mapping. Printed whenever it is not zero, including on
+	// an arm with the option off, where it should be impossible.
+	// tamnd/zu#769.
+	if refused := uint64(C.zu2_remap_refused(db.db)); refused > 0 {
+		fmt.Printf("zu2 mapping: %d refused by the kernel, so this run mapped less than it asked to\n",
+			refused)
+	}
+
 	// The tier's share of that disk number, which is the context every
 	// row measured with the tier on needs (tamnd/zu#600). How much of a
 	// database has settled down there depends on how much of the
