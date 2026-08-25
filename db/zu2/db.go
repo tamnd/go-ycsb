@@ -1044,6 +1044,35 @@ func (db *zu2DB) printStorage() {
 			float64(planeBytes)/mib, keys, each)
 	}
 
+	// The anonymous total, broken into the planes it is made of. This is
+	// tamnd/zu#767 and the point of it is that the planes get measured on
+	// a host rather than counted off the source, because the arithmetic
+	// on the issue is arithmetic and the arena has alignment and slack in
+	// it that no reading of the code produces.
+	//
+	// Three lines and not four. The mutable window is inside the
+	// anonymous page count already, since those pages are anonymous by
+	// construction, and the fourth line on the issue is the sessions,
+	// which are a cacheline and a scratch buffer each and are not worth a
+	// counter until something says they are.
+	//
+	// Mapped pages are deliberately absent. They are a mapping of a file
+	// the kernel can drop under pressure, which is the whole distinction
+	// #757 turns on, so putting them in a total called anonymous would
+	// undo the thing being measured.
+	logBytes := anonymous * pageBytes
+	indexBytes := uint64(C.zu2_index_bytes(db.db))
+	planeBytes := uint64(C.zu2_ordered_bytes(db.db))
+	total := logBytes + indexBytes + planeBytes
+	perKey := 0.0
+	if keys := uint64(C.zu2_index_keys(db.db)); keys > 0 {
+		perKey = float64(total) / float64(keys)
+	}
+	fmt.Printf("zu2 anonymous: %.1f MiB total, log %.1f, index %.1f (%d buckets), scan %.1f, %.1f bytes a key\n",
+		float64(total)/mib, float64(logBytes)/mib,
+		float64(indexBytes)/mib, uint64(C.zu2_index_buckets(db.db)),
+		float64(planeBytes)/mib, perKey)
+
 	// What the reads did to the cold tier. Zero on a run with no tier,
 	// on a run with promotion turned off, and on a run whose reads never
 	// reached the tier, and the three are different things: the first
