@@ -65,6 +65,7 @@ type core struct {
 	readAllFields        bool
 	writeAllFields       bool
 	dataIntegrity        bool
+	eachScan             bool
 
 	keySequence                  ycsb.Generator
 	operationChooser             *generator.Discrete
@@ -717,7 +718,7 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 	// dropped unread unless dataintegrity is on, and at 32 threads
 	// building them is at least 43 percent of what this call charges to
 	// the engine. See tamnd/zu#750.
-	if es, ok := db.(ycsb.EachScanner); ok {
+	if es, ok := db.(ycsb.EachScanner); ok && c.eachScan {
 		rows := 0
 		last := ""
 		err := es.ScanEach(ctx, c.table, startKeyName, int(scanLen), fields,
@@ -917,6 +918,7 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 	c.readAllFields = p.GetBool(prop.ReadAllFields, prop.ReadALlFieldsDefault)
 	c.writeAllFields = p.GetBool(prop.WriteAllFields, prop.WriteAllFieldsDefault)
 	c.dataIntegrity = p.GetBool(prop.DataIntegrity, prop.DataIntegrityDefault)
+	c.eachScan = p.GetBool(prop.EachScan, prop.EachScanDefault)
 	fieldLengthDistribution := p.GetString(prop.FieldLengthDistribution, prop.FieldLengthDistributionDefault)
 	if c.dataIntegrity && fieldLengthDistribution != "constant" {
 		util.Fatal("must have constant field size to check data integrity")

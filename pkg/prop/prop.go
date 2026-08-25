@@ -48,14 +48,20 @@ const (
 	FieldLength                    = "fieldlength"
 	FieldLengthDefault             = int64(100)
 	// Used if fieldlengthdistribution is "histogram"
-	FieldLengthHistogramFile         = "fieldlengthhistogram"
-	FieldLengthHistogramFileDefault  = "hist.txt"
-	ReadAllFields                    = "readallfields"
-	ReadALlFieldsDefault             = true
-	WriteAllFields                   = "writeallfields"
-	WriteAllFieldsDefault            = false
-	DataIntegrity                    = "dataintegrity"
-	DataIntegrityDefault             = false
+	FieldLengthHistogramFile        = "fieldlengthhistogram"
+	FieldLengthHistogramFileDefault = "hist.txt"
+	ReadAllFields                   = "readallfields"
+	ReadALlFieldsDefault            = true
+	WriteAllFields                  = "writeallfields"
+	WriteAllFieldsDefault           = false
+	DataIntegrity                   = "dataintegrity"
+	DataIntegrityDefault            = false
+	// EachScan picks the scan path when the driver has both. On by
+	// default because it is the faster one, and settable because the
+	// point of tamnd/zu#750 is the difference between them, and a
+	// difference nobody can turn off is not a measurement.
+	EachScan                         = "eachscan"
+	EachScanDefault                  = true
 	ReadProportion                   = "readproportion"
 	ReadProportionDefault            = float64(0.95)
 	UpdateProportion                 = "updateproportion"
