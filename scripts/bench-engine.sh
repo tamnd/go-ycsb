@@ -26,24 +26,39 @@ THREADS="${3:-1}"
 # it goes idle, and /tmp is tmpfs, so results written there vanish.
 WORK="${WORK:-$PWD/.bench}"
 
-# One benchmark at a time per work directory. Every engine here writes
-# to a fixed path under $WORK, so two runs started by mistake share the
+# One benchmark at a time on this host.
+#
+# It started as one per work directory, because every engine here writes
+# to a fixed path under $WORK and two runs started by mistake share the
 # same database: one loads while the other reads, and the numbers that
 # come out are not of anything. That happened on server2 and server3 and
 # it announced itself as a data integrity failure, which is the only
-# reason it was noticed. flock is not on every host, so a host without
-# it says so and carries on rather than refusing to run.
+# reason it was noticed.
+#
+# Per work directory is the wrong scope and the reason is that the
+# resource being fought over is not the database, it is the machine. Two
+# sweeps of mine ran at once on server1 out of ~/bench/wt-go-ycsb and
+# ~/bench/go-ycsb, took a lock each, waited for nothing, and put two 32
+# thread benchmarks on four cores. Neither number describes an engine.
+# Running loaded is fine and is the standing rule for these boxes, but
+# that is somebody else's load and it is roughly steady; this is one of
+# my runs measuring the other. tamnd/zu#376.
+#
+# So the lock is one per host and per user by default, and BENCH_LOCK
+# overrides it for a caller who really does want two at once and has a
+# reason. flock is not on every host, so a host without it says so and
+# carries on rather than refusing to run.
 mkdir -p "$WORK"
+LOCK="${BENCH_LOCK:-$HOME/.go-ycsb-bench.lock}"
 if command -v flock >/dev/null 2>&1; then
-  exec 9>"$WORK/.bench.lock"
+  exec 9>"$LOCK"
   if ! flock -n 9; then
-    echo "# another benchmark holds $WORK/.bench.lock, waiting for it" >&2
+    echo "# another benchmark on this host holds $LOCK, waiting for it" >&2
     flock 9
   fi
 else
   echo "# no flock on this host, so nothing is stopping two runs sharing $WORK" >&2
 fi
-mkdir -p "$WORK"
 
 BIN="${BIN:-$WORK/ycsb-$ENGINE}"
 OUT="${OUT:-$WORK/$ENGINE-r$RECORDS-t$THREADS.tsv}"
