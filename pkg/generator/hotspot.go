@@ -82,6 +82,5 @@ func (h *Hotspot) Next(r *rand.Rand) int64 {
 	} else {
 		value = h.lowerBound + h.hotInterval + r.Int63n(h.coldInterval)
 	}
-	h.SetLastValue(value)
 	return value
 }

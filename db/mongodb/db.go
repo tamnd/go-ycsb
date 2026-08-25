@@ -195,6 +195,19 @@ func (c mongodbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		cli: cli,
 		db:  cli.Database(mongodbDatabaseDefault),
 	}
+
+	// The same thing pg and neo4j do with the same property. Without it
+	// a sweep that runs the six core workloads in one go loads workload
+	// b on top of workload a's documents, and every insert after the
+	// first workload fails on a duplicate _id. The engines with a local
+	// path get an empty path instead, and this is the server side
+	// equivalent, so all of them start each workload from nothing.
+	if p.GetBool(prop.DropData, prop.DropDataDefault) {
+		table := p.GetString(prop.TableName, prop.TableNameDefault)
+		if err := m.db.Collection(table).Drop(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
 }
 

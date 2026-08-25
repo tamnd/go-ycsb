@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/magiconair/properties"
@@ -64,6 +65,7 @@ type core struct {
 	readAllFields        bool
 	writeAllFields       bool
 	dataIntegrity        bool
+	eachScan             bool
 
 	keySequence                  ycsb.Generator
 	operationChooser             *generator.Discrete
@@ -74,10 +76,27 @@ type core struct {
 	orderedInserts               bool
 	recordCount                  int64
 	zeroPadding                  int64
-	insertionRetryLimit          int64
-	insertionRetryInterval       int64
+	// The key prefix, read once at construction. It used to be read
+	// out of the properties map on every key built, which is a string
+	// map lookup per operation for a value that cannot change, and it
+	// was five percent of the client's CPU. See tamnd/zu#645.
+	keyPrefix              string
+	insertionRetryLimit    int64
+	insertionRetryInterval int64
 
 	valuePool sync.Pool
+
+	// What the scans actually handed back, which nothing used to look
+	// at. `doTransactionScan` throws the rows away, so an engine that
+	// returns nothing at all reports the fastest SCAN in the sweep and
+	// no error anywhere. That is how the duckdb rows in every sweep so
+	// far came to be wrong (tamnd/zu#551), and the same hole is open on
+	// this side of the call for every engine. These two are what close
+	// it: the run prints rows against scans at the end, and a mean well
+	// under the mean scan length is a result to throw away.
+	scans     atomic.Int64
+	scanRows  atomic.Int64
+	scanAsked atomic.Int64
 }
 
 func getFieldLengthGenerator(p *properties.Properties) ycsb.Generator {
@@ -157,16 +176,72 @@ func (c *core) CleanupThread(_ context.Context) {
 
 // Close implements the Workload Close interface.
 func (c *core) Close() error {
+	if scans := c.scans.Load(); scans > 0 {
+		rows := c.scanRows.Load()
+		asked := c.scanAsked.Load()
+		fmt.Printf("scan rows: %d rows over %d scans, %.1f a scan, %.1f asked for\n",
+			rows, scans, float64(rows)/float64(scans), float64(asked)/float64(scans))
+	}
 	return nil
 }
 
+// buildKeyName is the key for a key number: the prefix, then the number
+// left padded with zeros to `zeroPadding` digits.
+//
+// This used to be one `fmt.Sprintf` with an indexed dynamic width, which
+// is the slowest spelling `fmt` has, plus a properties lookup for the
+// prefix. Between them they were a quarter of what the client spends on
+// an operation before it reaches a driver, and the client's floor is
+// most of what every published throughput number measures (tamnd/zu#645).
+// Every byte this returns is the same byte the Sprintf returned, which
+// `TestBuildKeyNameMatchesSprintf` holds.
 func (c *core) buildKeyName(keyNum int64) string {
 	if !c.orderedInserts {
 		keyNum = util.Hash64(keyNum)
 	}
 
-	prefix := c.p.GetString(prop.KeyPrefix, prop.KeyPrefixDefault)
-	return fmt.Sprintf("%s%0[3]*[2]d", prefix, keyNum, c.zeroPadding)
+	// Big enough for the longest int64 with its sign and for any
+	// padding a sane run asks for, so the common case never allocates
+	// twice. A `zeroPadding` wider than this still comes out right, the
+	// append just grows the slice.
+	var stack [64]byte
+	buf := append(stack[:0], c.keyPrefix...)
+
+	// `fmt` puts the sign in front of the padding, so "%05d" of -42 is
+	// "-0042" and not "000-42", and the width is the whole field: the
+	// sign is one of the characters it counts, so "%02d" of -1 is "-1"
+	// and not "-01".
+	n := keyNum
+	width := int(c.zeroPadding)
+	if n < 0 {
+		buf = append(buf, '-')
+		width--
+	}
+	digits := 1
+	for m := n / 10; m != 0; m /= 10 {
+		digits++
+	}
+	for pad := width - digits; pad > 0; pad-- {
+		buf = append(buf, '0')
+	}
+	// Written from the back, because the digits come out least
+	// significant first. `-n` is not taken for the negative case:
+	// negating math.MinInt64 overflows, so the remainder is negated one
+	// digit at a time instead.
+	at := len(buf) + digits
+	if cap(buf) < at {
+		buf = append(buf, make([]byte, at-len(buf))...)
+	}
+	buf = buf[:at]
+	for i := at - 1; i >= at-digits; i-- {
+		d := n % 10
+		if d < 0 {
+			d = -d
+		}
+		buf[i] = byte('0' + d)
+		n /= 10
+	}
+	return string(buf)
 }
 
 func (c *core) buildSingleValue(state *coreState, key string) map[string][]byte {
@@ -244,10 +319,130 @@ func (c *core) buildDeterministicValue(state *coreState, key string, fieldKey st
 	return b.Bytes()
 }
 
+// verifyScan is verifyRow for a range scan.
+//
+// Scan hands back rows and not the keys they came from, so there is
+// nothing to derive an expected value from the way a read has. The rows
+// carry it themselves: a deterministic value opens with the key of the
+// row it belongs to followed by a colon, so every value names its own
+// key and can be rebuilt and compared once that key is read back out of
+// it.
+//
+// This exists because dataintegrity checked reads and left scans alone,
+// so nothing in the harness ever looked at a value workload E returned.
+// That is the hole tamnd/zu#551 went through on the read path, still
+// open on the scan path, and it is the one place a driver that reuses
+// buffers or maps between rows would show up.
+func (c *core) verifyScan(state *coreState, startKey string, rows []map[string][]byte) {
+	last := ""
+	for i, values := range rows {
+		if len(values) == 0 {
+			util.Fatalf("scan from %s: row %d came back with no fields at all", startKey, i)
+		}
+
+		key := ""
+		for fieldKey, value := range values {
+			at := bytes.IndexByte(value, ':')
+			if at < 0 {
+				util.Fatalf("scan from %s: row %d field %s carries no key, got %q",
+					startKey, i, fieldKey, value)
+			}
+			rowKey := string(value[:at])
+			// Every field of one row has to name the same key. A driver
+			// that hands back one map per row and fills them from a
+			// buffer it reuses would leak a field of the row before into
+			// this one, and this is what that looks like.
+			if key == "" {
+				key = rowKey
+			} else if rowKey != key {
+				util.Fatalf("scan from %s: row %d mixes rows, field %s belongs to %s and the rest to %s",
+					startKey, i, fieldKey, rowKey, key)
+			}
+			expected := c.buildDeterministicValue(state, rowKey, fieldKey)
+			if !bytes.Equal(expected, value) {
+				util.Fatalf("scan from %s: row %d field %s, expect %q, but got %q",
+					startKey, i, fieldKey, expected, value)
+			}
+		}
+
+		// A scan is a range read, so what comes back starts at the key
+		// asked for and climbs. The interface comment does not spell
+		// that out, but every driver here implements it and workload E
+		// is measuring a range scan, so rows outside the range or in no
+		// order are a wrong answer being timed as a fast one.
+		if key < startKey {
+			util.Fatalf("scan from %s: row %d is key %s, which is before the start",
+				startKey, i, key)
+		}
+		if last != "" && key <= last {
+			util.Fatalf("scan from %s: keys do not climb, %s then %s", startKey, last, key)
+		}
+		last = key
+	}
+}
+
+// verifyScanRow is verifyScan for one row of a scan taken through
+// EachScanner, where the rows arrive one at a time and there is no slice
+// to walk at the end.
+//
+// It checks the same three things: that the row has fields at all, that
+// every field of it names the same key and carries the value that key and
+// field are supposed to have, and that the keys climb from the start key.
+// `last` carries the previous row's key across calls, which is the only
+// state the slice version kept.
+func (c *core) verifyScanRow(state *coreState, startKey string, i int, fields []string, values [][]byte, last *string) {
+	found := 0
+	key := ""
+	for at, value := range values {
+		if value == nil {
+			continue
+		}
+		found++
+		fieldKey := fields[at]
+		sep := bytes.IndexByte(value, ':')
+		if sep < 0 {
+			util.Fatalf("scan from %s: row %d field %s carries no key, got %q",
+				startKey, i, fieldKey, value)
+		}
+		rowKey := string(value[:sep])
+		// Every field of one row has to name the same key. A driver
+		// filling one slice from a buffer it reuses would leak a field
+		// of the row before into this one, and this is what that looks
+		// like.
+		if key == "" {
+			key = rowKey
+		} else if rowKey != key {
+			util.Fatalf("scan from %s: row %d mixes rows, field %s belongs to %s and the rest to %s",
+				startKey, i, fieldKey, rowKey, key)
+		}
+		expected := c.buildDeterministicValue(state, rowKey, fieldKey)
+		if !bytes.Equal(expected, value) {
+			util.Fatalf("scan from %s: row %d field %s, expect %q, but got %q",
+				startKey, i, fieldKey, expected, value)
+		}
+	}
+
+	if found == 0 {
+		util.Fatalf("scan from %s: row %d came back with no fields at all", startKey, i)
+	}
+
+	if key < startKey {
+		util.Fatalf("scan from %s: row %d is key %s, which is before the start",
+			startKey, i, key)
+	}
+	if *last != "" && key <= *last {
+		util.Fatalf("scan from %s: keys do not climb, %s then %s", startKey, *last, key)
+	}
+	*last = key
+}
+
 func (c *core) verifyRow(state *coreState, key string, values map[string][]byte) {
+	// An empty row is the failure this check exists to catch, not a
+	// case to skip. An engine that stored the key and dropped the
+	// values answers every read without an error and passes a row count
+	// (tamnd/zu#551), and this used to wave it through as well.
 	if len(values) == 0 {
-		// null data here, need panic?
-		return
+		util.Fatalf("%s came back with no fields at all", key)
 	}
 
 	for fieldKey, value := range values {
@@ -441,7 +636,7 @@ func (c *core) doTransactionRead(ctx context.Context, db ycsb.DB, state *coreSta
 func (c *core) doTransactionReadModifyWrite(ctx context.Context, db ycsb.DB, state *coreState) error {
 	start := time.Now()
 	defer func() {
-		measurement.Measure("READ_MODIFY_WRITE", start, time.Now().Sub(start))
+		measurement.Measure(ctx, "READ_MODIFY_WRITE", start, time.Now().Sub(start))
 	}()
 
 	r := state.r
@@ -469,12 +664,21 @@ func (c *core) doTransactionReadModifyWrite(ctx context.Context, db ycsb.DB, sta
 		return err
 	}
 
-	if err := db.Update(ctx, c.table, keyName, values); err != nil {
-		return err
-	}
-
+	// Before the update, not after it. A driver is only promising that
+	// what a read hands back is good until the next call on the same
+	// connection, and the update is that next call. zu2 takes the promise
+	// literally: a read borrows the engine's own pages and holds an epoch
+	// over them, and the next call releases the epoch, after which a
+	// compaction pass running beside this one is free to unmap them. So a
+	// verify placed after the update reads freed pages. Checking what was
+	// read before overwriting it is the right order for every driver
+	// anyway, and it costs nothing.
 	if c.dataIntegrity {
 		c.verifyRow(state, keyName, readValues)
+	}
+
+	if err := db.Update(ctx, c.table, keyName, values); err != nil {
+		return err
 	}
 
 	return nil
@@ -489,6 +693,27 @@ func (c *core) doTransactionInsert(ctx context.Context, db ycsb.DB, state *coreS
 	defer c.putValues(values)
 
 	return db.Insert(ctx, c.table, dbKey, values)
+}
+
+// eachScanner answers whether this db really has the map free scan path,
+// and hands back the thing to call it on.
+//
+// Two questions, not one. The measurement wrapper implements ScanEach
+// whether the driver under it does or not, because a method it does not
+// forward is a method the workload cannot reach and cannot time. So the
+// capability is asked of the driver, through Unwrap, and the call is
+// made on the wrapper, so the scan is timed like every other one.
+func eachScanner(db ycsb.DB) (ycsb.EachScanner, bool) {
+	es, ok := db.(ycsb.EachScanner)
+	if !ok {
+		return nil, false
+	}
+	if w, ok := db.(interface{ Unwrap() ycsb.DB }); ok {
+		if _, has := w.Unwrap().(ycsb.EachScanner); !has {
+			return nil, false
+		}
+	}
+	return es, true
 }
 
 func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreState) error {
@@ -506,7 +731,51 @@ func (c *core) doTransactionScan(ctx context.Context, db ycsb.DB, state *coreSta
 		fields = state.fieldNames
 	}
 
-	_, err := db.Scan(ctx, c.table, startKeyName, int(scanLen), fields)
+	c.scans.Add(1)
+	c.scanAsked.Add(int64(scanLen))
+
+	// The driver that can hand columns back without building a map a row
+	// gets to. A scan returns fifty rows on average and the maps are
+	// dropped unread unless dataintegrity is on, and at 32 threads
+	// building them is at least 43 percent of what this call charges to
+	// the engine. See tamnd/zu#750.
+	// One thing to know before comparing the two paths' latencies on a
+	// dataintegrity run, and only on one. Verification happens inside the
+	// callback here because the values are the engine's own memory and are
+	// over when the callback returns, and the callback is inside the call
+	// the wrapper is timing. Down in the map path verifyScan runs after
+	// Scan has returned and the timer has stopped. So with dataintegrity
+	// on, this path's SCAN latency carries the checking and the other
+	// path's does not: ten thousand records of workload E on zu2 reports
+	// 349 us a scan here against 29 there, and none of that gap is the
+	// engine. Throughput is unaffected either way, since the work happens
+	// inside the operation whichever side of the timer it lands on.
+	//
+	// Left as it is rather than plumbed around, because dataintegrity is
+	// the correctness gate and no published number comes from a run with
+	// it on. bench-engine.sh keeps the gate's output to itself and prints
+	// a verdict, so these latencies do not reach a table. tamnd/zu#750.
+	if es, ok := eachScanner(db); ok && c.eachScan {
+		rows := 0
+		last := ""
+		err := es.ScanEach(ctx, c.table, startKeyName, int(scanLen), fields,
+			func(values [][]byte) error {
+				if c.dataIntegrity {
+					c.verifyScanRow(state, startKeyName, rows, fields, values, &last)
+				}
+				rows++
+				return nil
+			})
+		c.scanRows.Add(int64(rows))
+		return err
+	}
+
+	rows, err := db.Scan(ctx, c.table, startKeyName, int(scanLen), fields)
+	c.scanRows.Add(int64(len(rows)))
+
+	if err == nil && c.dataIntegrity {
+		c.verifyScan(state, startKeyName, rows)
+	}
 
 	return err
 }
@@ -543,13 +812,63 @@ func (c *core) doBatchTransactionRead(ctx context.Context, batchSize int, db ycs
 		keys[i] = c.buildKeyName(c.nextKeyNum(state))
 	}
 
-	_, err := db.BatchRead(ctx, c.table, keys, fields)
+	rows, err := db.BatchRead(ctx, c.table, keys, fields)
 	if err != nil {
 		return err
 	}
 
-	// TODO should we verify the result?
+	if c.dataIntegrity {
+		c.verifyBatchRead(state, keys, rows)
+	}
 	return nil
+}
+
+// verifyBatchRead is verifyRow for a batch.
+//
+// Two checks, because either one alone lets something through. The
+// values are checked the way a scan's are, by reading the key back out
+// of the value it is in, which works whatever order the rows arrive in.
+// That alone is not enough: a driver that hands back the same row for
+// every key of the batch returns rows that are each perfectly valid, and
+// only where they sit gives it away. So when the driver returns one row
+// per key, which every driver in this comparison does, row i is also
+// required to be key i.
+//
+// mysql and tikv ask for the batch as one IN query with no order and
+// collapse duplicate keys, so they come back with a different count and
+// get the value check only. That is the most that can be said about a
+// result that does not claim to be positional.
+func (c *core) verifyBatchRead(state *coreState, keys []string, rows []map[string][]byte) {
+	positional := len(rows) == len(keys)
+	for i, values := range rows {
+		if len(values) == 0 {
+			util.Fatalf("batch read: row %d of %d came back with no fields at all", i, len(rows))
+		}
+
+		key := ""
+		for fieldKey, value := range values {
+			at := bytes.IndexByte(value, ':')
+			if at < 0 {
+				util.Fatalf("batch read: row %d field %s carries no key, got %q", i, fieldKey, value)
+			}
+			rowKey := string(value[:at])
+			if key == "" {
+				key = rowKey
+			} else if rowKey != key {
+				util.Fatalf("batch read: row %d mixes rows, field %s belongs to %s and the rest to %s",
+					i, fieldKey, rowKey, key)
+			}
+			expected := c.buildDeterministicValue(state, rowKey, fieldKey)
+			if !bytes.Equal(expected, value) {
+				util.Fatalf("batch read: row %d field %s, expect %q, but got %q",
+					i, fieldKey, expected, value)
+			}
+		}
+
+		if positional && key != keys[i] {
+			util.Fatalf("batch read: asked for %s at position %d and got %s", keys[i], i, key)
+		}
+	}
 }
 
 func (c *core) doBatchTransactionInsert(ctx context.Context, batchSize int, db ycsb.BatchDB, state *coreState) error {
@@ -632,9 +951,11 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 			c.recordCount, insertStart, insertCount)
 	}
 	c.zeroPadding = p.GetInt64(prop.ZeroPadding, prop.ZeroPaddingDefault)
+	c.keyPrefix = p.GetString(prop.KeyPrefix, prop.KeyPrefixDefault)
 	c.readAllFields = p.GetBool(prop.ReadAllFields, prop.ReadALlFieldsDefault)
 	c.writeAllFields = p.GetBool(prop.WriteAllFields, prop.WriteAllFieldsDefault)
 	c.dataIntegrity = p.GetBool(prop.DataIntegrity, prop.DataIntegrityDefault)
+	c.eachScan = p.GetBool(prop.EachScan, prop.EachScanDefault)
 	fieldLengthDistribution := p.GetString(prop.FieldLengthDistribution, prop.FieldLengthDistributionDefault)
 	if c.dataIntegrity && fieldLengthDistribution != "constant" {
 		util.Fatal("must have constant field size to check data integrity")
@@ -661,7 +982,14 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 		insertProportion := p.GetFloat64(prop.InsertProportion, prop.InsertProportionDefault)
 		opCount := p.GetInt64(prop.OperationCount, 0)
 		expectedNewKeys := int64(float64(opCount) * insertProportion * 2.0)
-		keyrangeUpperBound = insertStart + insertCount + expectedNewKeys
+		// The last loaded key is insertStart+insertCount-1, the same
+		// bound the uniform and sequential branches use. Without the
+		// minus one this range includes a key that was never loaded and
+		// never will be, and a read of it comes back empty. With
+		// dataintegrity on that is a failed run; with it off, which is
+		// how a sweep runs, it is a read that returns nothing and
+		// reports as the fastest read in the sample.
+		keyrangeUpperBound = insertStart + insertCount - 1 + expectedNewKeys
 		c.keyChooser = generator.NewScrambledZipfian(keyrangeLowerBound, keyrangeUpperBound, generator.ZipfianConstant)
 	case "latest":
 		c.keyChooser = generator.NewSkewedLatest(c.transactionInsertKeySequence)
@@ -704,4 +1032,14 @@ func (coreCreator) Create(p *properties.Properties) (ycsb.Workload, error) {
 func init() {
 	ycsb.RegisterWorkloadCreator("core", coreCreator{})
 	ycsb.RegisterWorkloadCreator("site.ycsb.workloads.CoreWorkload", coreCreator{})
+}
+
+// slowBuildKeyName is what buildKeyName used to be, kept so the tests
+// can hold the new one against it and the benchmark can price the
+// difference. Nothing on a run calls this.
+func (c *core) slowBuildKeyName(keyNum int64) string {
+	if !c.orderedInserts {
+		keyNum = util.Hash64(keyNum)
+	}
+	return fmt.Sprintf("%s%0[3]*[2]d", c.keyPrefix, keyNum, c.zeroPadding)
 }

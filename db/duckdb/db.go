@@ -24,8 +24,8 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/magiconair/properties"
-	_ "github.com/marcboeker/go-duckdb/v2"
 
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
@@ -42,6 +42,7 @@ const (
 	duckdbMaxIdleConns   = "duckdb.maxidleconns"
 	duckdbRetries        = "duckdb.retries"
 	duckdbRetryBackoffMs = "duckdb.retry_backoff_ms"
+	duckdbReadTx         = "duckdb.readtx"
 )
 
 type duckdbCreator struct{}
@@ -53,6 +54,7 @@ type duckdbDB struct {
 
 	retries   int
 	backoffMs int
+	readTx    bool
 
 	bufPool *util.BufPool
 }
@@ -112,12 +114,32 @@ func (c duckdbCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
 	d.retries = p.GetInt(duckdbRetries, 10)
 	d.backoffMs = p.GetInt(duckdbRetryBackoffMs, 2)
+	// A read here is a single SELECT, and a single statement in DuckDB
+	// already runs in its own transaction. Wrapping it in an explicit
+	// BEGIN and COMMIT buys nothing and costs two more statements plus a
+	// trip through the conflict retry loop, which cannot fire on a read
+	// in the first place. Same defect the sqlite adapter had, see
+	// tamnd/zu#647. Set duckdb.readtx=true to get the old shape back.
+	d.readTx = p.GetBool(duckdbReadTx, false)
 	d.bufPool = util.NewBufPool()
 
 	if err := d.createTable(); err != nil {
 		db.Close()
 		return nil, err
 	}
+
+	// The engine version, in the output, once. The driver bundles its
+	// own DuckDB, so there is nothing installed on the host to ask and
+	// nothing in the TSV that would say which DuckDB produced a row. A
+	// benchmark that claims to run the latest of every engine has to be
+	// able to show it, and a go.mod line is the driver's version and not
+	// the engine's.
+	var version string
+	if err := d.db.QueryRow("select version()").Scan(&version); err == nil {
+		fmt.Printf("duckdb version: %s\n", version)
+	}
+	fmt.Printf("duckdb config: dsn=%q readtx=%v conns=%d\n",
+		dsn, d.readTx, db.Stats().MaxOpenConnections)
 
 	return d, nil
 }
@@ -202,7 +224,14 @@ func (db *duckdbDB) tx(ctx context.Context, f func(tx *sql.Tx) error) error {
 	return lastErr
 }
 
-func (db *duckdbDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
+// querier is the part of *sql.DB and *sql.Tx a read needs. It exists so
+// the read path can run against the pool directly when it is not asked
+// for a transaction.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func (db *duckdbDB) doQueryRows(ctx context.Context, tx querier, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
 	if db.verbose {
 		fmt.Printf("%s %v\n", query, args)
 	}
@@ -237,7 +266,7 @@ func (db *duckdbDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, c
 	return vs, rows.Err()
 }
 
-func (db *duckdbDB) doRead(ctx context.Context, tx *sql.Tx, table string, key string, fields []string) (map[string][]byte, error) {
+func (db *duckdbDB) doRead(ctx context.Context, tx querier, table string, key string, fields []string) (map[string][]byte, error) {
 	sel := "*"
 	if len(fields) > 0 {
 		sel = strings.Join(fields, ",")
@@ -254,6 +283,9 @@ func (db *duckdbDB) doRead(ctx context.Context, tx *sql.Tx, table string, key st
 }
 
 func (db *duckdbDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	if !db.readTx {
+		return db.doRead(ctx, db.db, table, key, fields)
+	}
 	var out map[string][]byte
 	err := db.tx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doRead(ctx, tx, table, key, fields)
@@ -263,7 +295,7 @@ func (db *duckdbDB) Read(ctx context.Context, table string, key string, fields [
 	return out, err
 }
 
-func (db *duckdbDB) doScan(ctx context.Context, tx *sql.Tx, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+func (db *duckdbDB) doScan(ctx context.Context, tx querier, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
 	sel := "*"
 	if len(fields) > 0 {
 		sel = strings.Join(fields, ",")
@@ -279,6 +311,9 @@ func (db *duckdbDB) doScan(ctx context.Context, tx *sql.Tx, table string, startK
 }
 
 func (db *duckdbDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	if !db.readTx {
+		return db.doScan(ctx, db.db, table, startKey, count, fields)
+	}
 	var out []map[string][]byte
 	err := db.tx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doScan(ctx, tx, table, startKey, count, fields)
@@ -326,10 +361,41 @@ func (db *duckdbDB) doInsert(ctx context.Context, tx *sql.Tx, table string, key 
 	args := make([]interface{}, 0, 1+len(values))
 	args = append(args, key)
 
-	// OR IGNORE matches what the sqlite adapter does, so a duplicate key
-	// from the workload generator is a no-op in both rather than an error
-	// in one of them.
-	buf.WriteString("INSERT OR IGNORE INTO ")
+	// A plain INSERT, and not the OR IGNORE the sqlite adapter uses, and
+	// this is a workaround rather than a preference.
+	//
+	// DuckDB 1.4.1 matches the column list of an INSERT that carries a
+	// conflict clause case sensitively, and matches it case insensitively
+	// without one. The table is declared with FIELD0 upwards and the
+	// workload hands its fields over as field0 upwards, so
+	// INSERT OR IGNORE INTO usertable (YCSB_KEY, field0, ...) resolved
+	// the key and resolved none of the fields, and the columns that were
+	// not resolved took their default, which is NULL. Nothing was
+	// reported: the statement prepared, the row landed, and the row was a
+	// key with ten NULL columns beside it. It is the clause and not the
+	// wording, so OR IGNORE, OR REPLACE and ON CONFLICT DO NOTHING all do
+	// it, and it does it with literal values as readily as with
+	// parameters, which is what says it is name resolution and not
+	// binding. A table whose key column is NOT NULL and whose key is also
+	// named in the wrong case gets a constraint error instead, which is
+	// how the shape of it was found.
+	//
+	// That is a silent wrong answer and it invalidated every duckdb
+	// number this harness has produced: a load of 100000 records of a
+	// kilobyte each settled at 8.5 MiB on device, which is 89 bytes a
+	// record and is the key and its index and nothing else, and every
+	// read afterwards was a fast read of a row with no data in it.
+	//
+	// DuckDB 1.5.5 answers this correctly. go-duckdb v2.4.3 is the newest
+	// there is and it carries 1.4.1, so the workaround stays until the
+	// bindings carry a 1.5.
+	//
+	// YCSB generates each key once in a load, so a conflict clause was
+	// insurance rather than a requirement. The insurance is taken here
+	// instead, by treating a constraint violation as the no-op OR IGNORE
+	// would have made it, which keeps the semantics the sqlite adapter
+	// has without the clause that resolves its columns differently.
+	buf.WriteString("INSERT INTO ")
 	buf.WriteString(table)
 	buf.WriteString(" (YCSB_KEY")
 
@@ -346,10 +412,25 @@ func (db *duckdbDB) doInsert(ctx context.Context, tx *sql.Tx, table string, key 
 	buf.WriteByte(')')
 
 	_, err := tx.ExecContext(ctx, buf.String(), args...)
+	if err != nil && isDuplicate(err) {
+		return nil
+	}
 	if err != nil && db.verbose {
 		fmt.Printf("error(doInsert): %s: %+v\n", buf.String(), err)
 	}
 	return err
+}
+
+// isDuplicate says whether an error is the primary key already being
+// there, which is the one error a load may meet and carry on from.
+//
+// By the text, because the driver hands back an error whose type says
+// nothing about which constraint was broken. There is one constraint on
+// the table and it is the primary key, so the match is as specific as it
+// needs to be.
+func isDuplicate(err error) bool {
+	return strings.Contains(err.Error(), "Constraint Error") &&
+		strings.Contains(err.Error(), "Duplicate key")
 }
 
 func (db *duckdbDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {

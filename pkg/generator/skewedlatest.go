@@ -63,6 +63,5 @@ func NewSkewedLatest(basis ycsb.Generator) *SkewedLatest {
 func (s *SkewedLatest) Next(r *rand.Rand) int64 {
 	max := s.basis.Last()
 	next := max - s.zipfian.next(r, max)
-	s.SetLastValue(next)
 	return next
 }

@@ -61,6 +61,37 @@ func appendVarint(b []byte, v int64) []byte {
 	return append(b, data[:n]...)
 }
 
+// EachColumn walks a row and hands every column id and value to fn,
+// without building anything.
+//
+// DecodeRow builds a map[int64][]byte that every caller then copies into
+// a second map keyed by field name and throws away, which is two maps
+// and about twenty allocations for a row that is ten fields of a
+// hundred bytes. On workload E that is per row of every scan, so it is
+// the largest single cost in a scan for every engine that stores rows
+// in this encoding. This is the same walk with the map left out.
+//
+// The values alias b, the way DecodeRow's always have.
+func EachColumn(b []byte, fn func(id int64, value []byte)) error {
+	if len(b) == 0 || (len(b) == 1 && b[0] == 0) {
+		return nil
+	}
+	for len(b) > 0 {
+		remain, rowID, err := decodeInt64(b)
+		if err != nil {
+			return err
+		}
+		var v []byte
+		remain, v, err = decodeBytes(remain)
+		if err != nil {
+			return err
+		}
+		fn(rowID, v)
+		b = remain
+	}
+	return nil
+}
+
 // DecodeRow decodes a byte slice into columns.
 // Row layout: colID1, value1, colID2, value2, .....
 // It is a simplified and specialized version of `github.com/pingcap/tidb/tablecodec.DecodeRow`.

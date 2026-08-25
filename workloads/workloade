@@ -26,6 +26,15 @@
 # instead interspersed with posts from lots of other threads. The way the YCSB client works is that it will pick a start
 # key, and then request a number of records; this works fine even for hashed insertion.
 
+# tamnd note: this file is back on the YCSB values. pingcap/go-ycsb
+# 6f16ad8 in 2019 turned requestdistribution from zipfian to uniform
+# across a, b, c, e and f, and in this file it also turned maxscanlength
+# from 100 down to 1. A scan of one row is a point read through the range
+# API, so workload E stopped measuring scanning at all, and a uniform
+# request distribution takes the locality out of the workload that the
+# YCSB paper put there on purpose. Neither is what a reader who is told
+# "YCSB workload E" expects to have been run.
+
 recordcount=1000
 operationcount=1000
 workload=core
@@ -37,9 +46,9 @@ updateproportion=0
 scanproportion=0.95
 insertproportion=0.05
 
-requestdistribution=uniform
+requestdistribution=zipfian
 
-maxscanlength=1
+maxscanlength=100
 
 scanlengthdistribution=uniform
 

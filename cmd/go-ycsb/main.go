@@ -78,12 +78,18 @@ import (
 	_ "github.com/pingcap/go-ycsb/db/dynamodb"
 	// Register duckdb database
 	_ "github.com/pingcap/go-ycsb/db/duckdb"
+	// Register pebble database
+	_ "github.com/pingcap/go-ycsb/db/pebble"
+	// Register lmdb database
+	_ "github.com/pingcap/go-ycsb/db/lmdb"
 	// Register ladybug database
 	_ "github.com/pingcap/go-ycsb/db/ladybug"
 	// Register neo4j database
 	_ "github.com/pingcap/go-ycsb/db/neo4j"
 	// Register zu database
 	_ "github.com/pingcap/go-ycsb/db/zu"
+	// Register zu2 database
+	_ "github.com/pingcap/go-ycsb/db/zu2"
 	// Register s3 database
 	_ "github.com/pingcap/go-ycsb/db/s3"
 )

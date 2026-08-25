@@ -61,7 +61,6 @@ func (d *Discrete) Next(r *rand.Rand) int64 {
 	for _, p := range d.values {
 		pw := p.Weight / sum
 		if val < pw {
-			d.SetLastValue(p.Value)
 			return p.Value
 		}
 

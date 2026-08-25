@@ -33,12 +33,25 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/boltdb/bolt"
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
+	bolt "go.etcd.io/bbolt"
 )
+
+// bbolt and not github.com/boltdb/bolt, which is what this driver was
+// written against. That repository was archived in 2017 and its last
+// release, v1.3.1, is from May of that year. bbolt is the same file
+// format and the same API under new maintenance, and it is what every
+// consumer of Bolt has been on for years, etcd included. Measuring a
+// nine year old build against engines released this year is not a
+// comparison anybody can read, and the standing rule for this fork is
+// every engine at its latest version. tamnd/zu#726.
+//
+// The import is aliased so the rest of the file reads as it did. The
+// call surface this driver uses, Open, View, Update, Bucket, Get, Put,
+// Delete and Cursor, is identical in both.
 
 // properties
 const (
@@ -48,6 +61,7 @@ const (
 	boltReadOnly        = "bolt.read_only"
 	boltMmapFlags       = "bolt.mmap_flags"
 	boltInitialMmapSize = "bolt.initial_mmap_size"
+	boltNoSync          = "bolt.no_sync"
 )
 
 type boltCreator struct {
@@ -80,6 +94,21 @@ func (c boltCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		return nil, err
 	}
 
+	// The one durability knob Bolt has, and it is a field on the open
+	// database rather than an option, which is why it is set here and
+	// not in getOptions. Every other engine in this harness is measured
+	// at its fastest setting, sqlite at synchronous=OFF, pg at
+	// synchronous_commit=off, lmdb with no fsync, so leaving Bolt at a
+	// fsync per commit would be reporting one engine's durability as
+	// another engine's throughput. A load at ten thousand records took
+	// 78 seconds with this off, 128 inserts a second, and that number is
+	// a measurement of the disk. tamnd/zu#726.
+	//
+	// Off by default rather than on, because it is the library's own
+	// default and a harness should not quietly make a database less
+	// durable than the caller asked for. The sweep sets it.
+	db.NoSync = p.GetBool(boltNoSync, false)
+
 	return &boltDB{
 		p:       p,
 		db:      db,
@@ -91,7 +120,13 @@ func (c boltCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 func getOptions(p *properties.Properties) boltOptions {
 	path := p.GetString(boltPath, "/tmp/boltdb")
 
-	opts := bolt.DefaultOptions
+	// A copy of the defaults and not the pointer. DefaultOptions is a
+	// package level *Options, so assigning it and then writing through
+	// it edits the library's own defaults for the rest of the process.
+	// Nothing in this harness opens a second Bolt database, so it has
+	// never shown, and it is still not something this should be doing.
+	defaults := *bolt.DefaultOptions
+	opts := &defaults
 	opts.Timeout = p.GetDuration(boltTimeout, 0)
 	opts.NoGrowSync = p.GetBool(boltNoGrowSync, false)
 	opts.ReadOnly = p.GetBool(boltReadOnly, false)
@@ -129,15 +164,25 @@ func (db *boltDB) Read(ctx context.Context, table string, key string, fields []s
 			return fmt.Errorf("key not found: %s.%s", table, key)
 		}
 
+		// Copied before the decode. bolt says the value Get returns is
+		// valid only for the life of the transaction, and the decode
+		// sub-slices rather than copying (decodeBytes ends `return
+		// remain[n:], remain[:n], nil`), so without this the map handed
+		// back points into the mapping after the transaction is done with
+		// it. Same defect as a1f84f2 and ca572fb, tamnd/zu#726.
 		var err error
-		m, err = db.r.Decode(row, fields)
+		m, err = db.r.Decode(append([]byte(nil), row...), fields)
 		return err
 	})
 	return m, err
 }
 
 func (db *boltDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
-	res := make([]map[string][]byte, count)
+	// Appended rather than sized to count. Sizing it left every position a
+	// short scan did not reach as a nil map, so a scan that found ten rows
+	// returned ten rows and forty nils and the caller could not tell a row
+	// that was not there from a row that was empty.
+	res := make([]map[string][]byte, 0, count)
 	err := db.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(table))
 		if bucket == nil {
@@ -146,14 +191,15 @@ func (db *boltDB) Scan(ctx context.Context, table string, startKey string, count
 
 		cursor := bucket.Cursor()
 		key, value := cursor.Seek([]byte(startKey))
-		for i := 0; key != nil && i < count; i++ {
-			m, err := db.r.Decode(value, fields)
+		for ; key != nil && len(res) < count; key, value = cursor.Next() {
+			// Copied for the reason Read copies it, and here it is fifty
+			// rows an operation rather than one.
+			m, err := db.r.Decode(append([]byte(nil), value...), fields)
 			if err != nil {
 				return err
 			}
 
-			res[i] = m
-			key, value = cursor.Next()
+			res = append(res, m)
 		}
 
 		return nil
@@ -162,6 +208,19 @@ func (db *boltDB) Scan(ctx context.Context, table string, startKey string, count
 }
 
 func (db *boltDB) Update(ctx context.Context, table string, key string, values map[string][]byte) error {
+	// Taken and released outside the transaction. bolt says the value
+	// given to Put must stay valid for the life of the transaction: it
+	// keeps the slice in the node and writes it at commit rather than
+	// copying it. Releasing it inside the closure, which is what this used
+	// to do, put it back in the pool before the commit, and BufPool.Get
+	// only reslices to zero length, so the next Encode on any thread
+	// overwrote a value bolt had not written yet. Same bug as 00d9f3e
+	// fixed in badger.
+	buf := db.bufPool.Get()
+	defer func() {
+		db.bufPool.Put(buf)
+	}()
+
 	err := db.db.Update(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket([]byte(table))
 		if bucket == nil {
@@ -182,11 +241,6 @@ func (db *boltDB) Update(ctx context.Context, table string, key string, values m
 			data[field] = value
 		}
 
-		buf := db.bufPool.Get()
-		defer func() {
-			db.bufPool.Put(buf)
-		}()
-
 		buf, err = db.r.Encode(buf, data)
 		if err != nil {
 			return err
@@ -198,25 +252,25 @@ func (db *boltDB) Update(ctx context.Context, table string, key string, values m
 }
 
 func (db *boltDB) Insert(ctx context.Context, table string, key string, values map[string][]byte) error {
-	err := db.db.Update(func(tx *bolt.Tx) error {
+	// Encoded before the transaction and released after it, for the reason
+	// Update gives: bolt keeps the slice Put is given until the commit.
+	buf := db.bufPool.Get()
+	defer func() {
+		db.bufPool.Put(buf)
+	}()
+
+	buf, err := db.r.Encode(buf, values)
+	if err != nil {
+		return err
+	}
+
+	return db.db.Update(func(tx *bolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists([]byte(table))
 		if err != nil {
 			return err
 		}
-
-		buf := db.bufPool.Get()
-		defer func() {
-			db.bufPool.Put(buf)
-		}()
-
-		buf, err = db.r.Encode(buf, values)
-		if err != nil {
-			return err
-		}
-
 		return bucket.Put([]byte(key), buf)
 	})
-	return err
 }
 
 func (db *boltDB) Delete(ctx context.Context, table string, key string) error {

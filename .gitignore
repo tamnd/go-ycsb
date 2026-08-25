@@ -14,3 +14,6 @@ tool/tool
 # hdr-plot output format
 *.png
 .bench/
+
+# The built binary, which a plain go build drops here.
+/go-ycsb

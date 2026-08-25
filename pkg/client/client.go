@@ -210,7 +210,10 @@ func (c *Client) Run(ctx context.Context) {
 			defer wg.Done()
 
 			w := newWorker(c.p, threadId, threadCount, c.workload, c.db)
-			ctx := c.workload.InitThread(ctx, threadId, threadCount)
+			// The worker's own measurer, so the run does not funnel
+			// every operation through one process wide lock.
+			ctx := measurement.InitThread(ctx, threadId)
+			ctx = c.workload.InitThread(ctx, threadId, threadCount)
 			ctx = c.db.InitThread(ctx, threadId, threadCount)
 			w.run(ctx)
 			c.db.CleanupThread(ctx)

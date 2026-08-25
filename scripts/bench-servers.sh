@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Bring up the two engines that need a server, at the settings that make
-# each one as fast as it goes, and wait until both answer.
+# Bring up the engines that need a server, at the settings that make
+# each one as fast as it goes, and wait until they answer.
 #
 # usage: scripts/bench-servers.sh [up|down|wait]
 #
-# Both containers run on the host doing the measuring, so the hop is
-# loopback. Neo4j cannot be embedded at all and PostgreSQL is not embedded
-# here, so those two pay a protocol round trip the in process engines do
-# not. That is what running them costs and the numbers say so.
+# Every container runs on the host doing the measuring, so the hop is
+# loopback. Neo4j cannot be embedded at all, and PostgreSQL and MongoDB
+# are not embedded here, so those three pay a protocol round trip the in
+# process engines do not. That is what running them costs and the
+# numbers say so.
 
 set -uo pipefail
 
@@ -15,15 +16,26 @@ NEO4J_PASSWORD="${NEO4J_PASSWORD:-benchpass}"
 PGPASSWORD="${PGPASSWORD:-benchpass}"
 PGPORT="${PGPORT:-55432}"
 BOLT_PORT="${BOLT_PORT:-7687}"
+# 57017 rather than 27017 for the reason pg is on 55432: a host that
+# already runs MongoDB for something else should not have to stop it.
+MONGO_PORT="${MONGO_PORT:-57017}"
+# Same reasoning again for the two in memory engines, and they get a port
+# each so both can be up together and neither is measured on the other's
+# data.
+REDIS_PORT="${REDIS_PORT:-56379}"
+VALKEY_PORT="${VALKEY_PORT:-56380}"
+KEYDB_PORT="${KEYDB_PORT:-56381}"
+GARNET_PORT="${GARNET_PORT:-56382}"
 
 # Sized against a 32 GB host. Both get enough that the whole working set
 # is resident, because a benchmark that pages is measuring the disk.
 HEAP="${NEO4J_HEAP:-8G}"
 PAGECACHE="${NEO4J_PAGECACHE:-8G}"
 SHARED_BUFFERS="${PG_SHARED_BUFFERS:-8GB}"
+WT_CACHE="${MONGO_WT_CACHE:-8}"
 
 up() {
-  docker rm -f neo4j-ycsb pg-ycsb >/dev/null 2>&1
+  docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb >/dev/null 2>&1
 
   docker run -d --name neo4j-ycsb --restart unless-stopped \
     -p "$BOLT_PORT":7687 -p 7474:7474 \
@@ -49,22 +61,106 @@ up() {
     -c checkpoint_timeout=30min \
     -c wal_level=minimal \
     -c max_wal_senders=0 >/dev/null
+
+  # The journal cannot be turned off any more, it has been mandatory
+  # since 6.0, so the bargain MongoDB is held to is the one it makes by
+  # default: acknowledge on the primary and let the journal flush on its
+  # own interval. That is w=1 j=false, which is what the connection
+  # string in bench-engine.sh asks for and is the same bargain as
+  # sqlite at synchronous=OFF and pg at synchronous_commit=off. The
+  # cache is sized so the working set is resident, like the other two.
+  docker run -d --name mongo-ycsb --restart unless-stopped \
+    -p "$MONGO_PORT":27017 \
+    mongo:latest --wiredTigerCacheSizeGB "$WT_CACHE" >/dev/null
+
+  # Redis and its fork, both with persistence off, which is the same
+  # bargain the others are held to and in Redis's case the one it is
+  # usually run under. save "" turns off the periodic RDB snapshot and
+  # appendonly no turns off the log, so nothing here waits for a device
+  # and none of these numbers is a durability claim either.
+  #
+  # No maxmemory. An eviction policy that starts dropping keys partway
+  # through a load would be measured as a fast load of a database that is
+  # missing records, and the row count check would catch it, but the
+  # right answer is not to arm it in the first place.
+  docker run -d --name redis-ycsb --restart unless-stopped \
+    -p "$REDIS_PORT":6379 \
+    redis:latest redis-server --save "" --appendonly no >/dev/null
+
+  docker run -d --name valkey-ycsb --restart unless-stopped \
+    -p "$VALKEY_PORT":6379 \
+    valkey/valkey:latest valkey-server --save "" --appendonly no >/dev/null
+
+  # KeyDB is the multithreaded fork. server-threads is the whole reason
+  # it is in the table, so it is set rather than left at the default of
+  # one, which would make it Redis with extra steps. Eight is what the
+  # project suggests as a sane ceiling and is a quarter of the cores on
+  # the smallest host here.
+  docker run -d --name keydb-ycsb --restart unless-stopped \
+    -p "$KEYDB_PORT":6379 \
+    eqalpha/keydb:latest keydb-server --save "" --appendonly no \
+      --server-threads "${KEYDB_THREADS:-8}" >/dev/null
+
+  # Garnet keeps its checkpoints and its log under one directory and
+  # takes neither by default, so there is nothing to turn off here the
+  # way there is for the other three. It is not Redis derived, it only
+  # speaks the same protocol.
+  docker run -d --name garnet-ycsb --restart unless-stopped \
+    -p "$GARNET_PORT":6379 \
+    ghcr.io/microsoft/garnet:latest --port 6379 >/dev/null
+
 }
 
 # restart unless-stopped only helps once the docker daemon is back. On
 # WSL the daemon goes away with the VM, so ask for a start either way.
+#
+# A container that is crash looping is started here and stays down, and
+# the only sign of it is the wait timing out two minutes later with
+# Restarting in the status line. Both engines get there on their own:
+# PostgreSQL leaves a zero length postmaster.pid behind when the VM goes
+# away under it and then refuses to start on the remnant, and Neo4j on
+# latest reads a data directory an older tag wrote and fails validating
+# a setting the newer one does not take from that path. Neither is worth
+# recovering by hand for a benchmark that owns its data, so a container
+# that is restarting is rebuilt from nothing instead of waited on.
 start_existing() {
-  docker start neo4j-ycsb pg-ycsb >/dev/null 2>&1
+  local name
+  for name in neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb; do
+    case "$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null)" in
+      # Nothing there at all, which is a first run on this host.
+      "")           echo "building both, $name is not there"; up; return ;;
+      restarting)   echo "rebuilding both, $name is crash looping"; up; return ;;
+    esac
+  done
+  docker start neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb >/dev/null 2>&1
 }
 
 wait_ready() {
   local i
   for i in $(seq 1 120); do
     if docker exec pg-ycsb pg_isready -q -U postgres >/dev/null 2>&1 &&
+       docker exec mongo-ycsb mongosh --quiet --eval 'db.runCommand({ping:1}).ok' >/dev/null 2>&1 &&
+       docker exec redis-ycsb redis-cli ping >/dev/null 2>&1 &&
+       docker exec valkey-ycsb valkey-cli ping >/dev/null 2>&1 &&
+       docker exec keydb-ycsb keydb-cli ping >/dev/null 2>&1 &&
+       # Garnet ships no client of its own in the image, so it is asked
+       # with a throwaway redis-cli sharing its network namespace. That
+       # is why this reads localhost and port 6379 rather than the
+       # published port: inside the namespace it is the same interface
+       # Garnet is listening on, and it does not depend on the container
+       # being able to route back to the host.
+       docker run --rm --network container:garnet-ycsb redis:latest \
+         redis-cli ping >/dev/null 2>&1 &&
        docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
          'RETURN 1' >/dev/null 2>&1; then
       echo "servers ready after ${i}s"
       docker exec pg-ycsb psql -U postgres -tAc 'select version()'
+      docker exec mongo-ycsb mongosh --quiet --eval 'db.version()'
+      docker exec redis-ycsb redis-cli info server | sed -n 's/^redis_version:/redis /p'
+      docker exec valkey-ycsb valkey-cli info server | sed -n 's/^valkey_version:/valkey /p'
+      docker exec keydb-ycsb keydb-cli info server | sed -n 's/^redis_version:/keydb /p'
+      docker run --rm --network container:garnet-ycsb redis:latest \
+        redis-cli info server | sed -n 's/^garnet_version:/garnet /p'
       docker exec neo4j-ycsb cypher-shell -u neo4j -p "$NEO4J_PASSWORD" \
         'call dbms.components() yield name, versions return name, versions' | tail -3
       return 0
@@ -79,6 +175,6 @@ wait_ready() {
 case "${1:-up}" in
   up)   up; wait_ready ;;
   wait) start_existing; wait_ready ;;
-  down) docker rm -f neo4j-ycsb pg-ycsb ;;
+  down) docker rm -f neo4j-ycsb pg-ycsb mongo-ycsb redis-ycsb valkey-ycsb keydb-ycsb garnet-ycsb ;;
   *)    echo "usage: $0 [up|down|wait]" >&2; exit 2 ;;
 esac

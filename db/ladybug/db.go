@@ -142,7 +142,17 @@ func (c ladybugCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	cpath := C.CString(path)
 	defer C.free(unsafe.Pointer(cpath))
 	if state := C.lbug_database_init(cpath, sysCfg, &d.db); state != C.LbugSuccess {
-		return nil, fmt.Errorf("ladybug: database init %q failed", path)
+		// The C API gives back a state and no message on this call, so
+		// the only account of why is what was asked for and what the
+		// machine had. It is worth carrying: the buffer pool defaults to
+		// a share of memory, and an init that fails on a machine with
+		// something large already resident fails here with nothing said.
+		// The gamingpc sweep of 2026-08-22 lost all three ladybug passes
+		// this way, next to a vLLM server holding seven gigabytes.
+		return nil, fmt.Errorf(
+			"ladybug: database init %q failed, buffer pool %d bytes, %s",
+			path, uint64(sysCfg.buffer_pool_size), memoryAvailable(),
+		)
 	}
 
 	// The schema goes in on its own connection before any worker starts.
@@ -157,6 +167,22 @@ func (c ladybugCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	}
 
 	return d, nil
+}
+
+// memoryAvailable is what the kernel says is there for the asking, for
+// the init error to carry. Linux only, since that is where the sweeps
+// run, and it says so rather than guessing anywhere else.
+func memoryAvailable() string {
+	meminfo, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return "memory available unknown"
+	}
+	for _, line := range strings.Split(string(meminfo), "\n") {
+		if after, ok := strings.CutPrefix(line, "MemAvailable:"); ok {
+			return "MemAvailable " + strings.TrimSpace(after)
+		}
+	}
+	return "memory available unknown"
 }
 
 // setBool writes a property into a C bool only when the run actually set

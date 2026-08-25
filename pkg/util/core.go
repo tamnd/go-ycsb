@@ -48,36 +48,154 @@ func allFields(p *properties.Properties) []string {
 type RowCodec struct {
 	fieldIndices map[string]int64
 	fields       []string
+	// The field names by column id, which is the reverse of
+	// fieldIndices and is what lets a decode name a column without a
+	// lookup. The ids are dense from zero because createFieldIndices
+	// hands them out that way.
+	fieldNames []string
 }
 
 // NewRowCodec creates the RowCodec
 func NewRowCodec(p *properties.Properties) *RowCodec {
+	indices := createFieldIndices(p)
+	names := make([]string, len(indices))
+	for field, i := range indices {
+		names[i] = field
+	}
 	return &RowCodec{
-		fieldIndices: createFieldIndices(p),
+		fieldIndices: indices,
 		fields:       allFields(p),
+		fieldNames:   names,
 	}
 }
 
 // Decode decodes the row and returns a field-value map
+//
+// One walk of the row rather than a walk into a map[int64][]byte and a
+// copy of that map into this one. The intermediate map was two thirds
+// of the allocations a decoded row cost, and a scan decodes fifty rows,
+// which made it the largest cost in workload E for every engine that
+// keeps rows in this encoding.
 func (r *RowCodec) Decode(row []byte, fields []string) (map[string][]byte, error) {
+	return r.DecodeInto(row, fields, nil)
+}
+
+// DecodeInto is Decode into a map the caller keeps and hands back.
+//
+// A decoded row costs a map allocation and one insertion a field, and
+// on a read heavy workload the allocation is the larger half of that: a
+// thirty two thread profile of zu2 through this harness put makemap at
+// 16.4 percent of the run and the insertions at 5.8. A driver that
+// keeps one map a session and passes it here pays the insertions only.
+//
+// `into` is cleared first, so what comes back holds this row and no
+// part of the row before it. A driver that reuses a map this way is
+// promising its caller that the map is good until the next call on the
+// same connection, which is the same promise it already makes about a
+// value that points into a reused buffer.
+//
+// A nil `into` allocates, which is what Decode does.
+func (r *RowCodec) DecodeInto(row []byte, fields []string, into map[string][]byte) (map[string][]byte, error) {
 	if len(fields) == 0 {
 		fields = r.fields
 	}
 
-	data, err := DecodeRow(row)
+	res := into
+	if res == nil {
+		res = make(map[string][]byte, len(fields))
+	} else {
+		clear(res)
+	}
+	all := len(fields) == len(r.fields)
+	err := EachColumn(row, func(id int64, value []byte) {
+		if id < 0 || int(id) >= len(r.fieldNames) {
+			return
+		}
+		field := r.fieldNames[id]
+		if !all {
+			wanted := false
+			for _, f := range fields {
+				if f == field {
+					wanted = true
+					break
+				}
+			}
+			if !wanted {
+				return
+			}
+		}
+		res[field] = value
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	res := make(map[string][]byte, len(fields))
-	for _, field := range fields {
-		i := r.fieldIndices[field]
-		if v, ok := data[i]; ok {
-			res[field] = v
+	return res, nil
+}
+
+// Fields is the full field list in column order, which is what an empty
+// fields slice means everywhere else here. A driver that has to name its
+// columns rather than ask for all of them needs the list itself.
+func (r *RowCodec) Fields() []string {
+	return r.fields
+}
+
+// Positions maps a column id to where that column belongs in a fields
+// slice, or to -1 when the fields slice does not ask for it.
+//
+// Built once for a connection and handed to DecodeEach on every row,
+// which is what keeps DecodeEach free of both a map and any string work.
+// Doing the same job inside the decode would mean either comparing field
+// names a column a row, or assuming a full fields slice arrives in column
+// order, and the second is true of this workload today and is not
+// something a decode should quietly depend on.
+//
+// An empty fields slice means every field, the same as elsewhere here.
+// `into` is grown or reused.
+func (r *RowCodec) Positions(fields []string, into []int) []int {
+	if len(fields) == 0 {
+		fields = r.fields
+	}
+	if cap(into) < len(r.fieldNames) {
+		into = make([]int, len(r.fieldNames))
+	}
+	into = into[:len(r.fieldNames)]
+	for i := range into {
+		into[i] = -1
+	}
+	for i, f := range fields {
+		if id, ok := r.fieldIndices[f]; ok {
+			into[id] = i
 		}
 	}
+	return into
+}
 
-	return res, nil
+// DecodeEach is Decode with no map in it: the row is walked and each
+// wanted column is dropped into the slot Positions gave it.
+//
+// `into` is the caller's, is sized to the fields slice the positions were
+// built from, and comes back holding one entry a field with nil where the
+// row carried no such column. The values point into `row` rather than
+// into a copy of it, the same as DecodeInto.
+//
+// A pooled DecodeInto is 166 ns a row where this is 77, ten fields of a
+// hundred bytes on an i9-13900K, and a scan decodes fifty rows inside the
+// call the harness times. See tamnd/zu#750.
+func (r *RowCodec) DecodeEach(row []byte, positions []int, into [][]byte) ([][]byte, error) {
+	clear(into)
+	err := EachColumn(row, func(id int64, value []byte) {
+		if id < 0 || int(id) >= len(positions) {
+			return
+		}
+		if p := positions[id]; p >= 0 && p < len(into) {
+			into[p] = value
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	return into, nil
 }
 
 // Encode encodes the values

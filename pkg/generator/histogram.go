@@ -129,6 +129,5 @@ func (h *Histogram) Next(r *rand.Rand) int64 {
 	}
 
 	v := i * h.blockSize
-	h.SetLastValue(v)
 	return v
 }

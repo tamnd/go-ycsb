@@ -63,6 +63,7 @@ case "$ENGINE" in
   duckdb)  ARGS=(-p duckdb.dbpath="$DATA.db") ;;
   ladybug) ARGS=(-p ladybug.dbpath="$DATA.lbug") ;;
   zu)      ARGS=(-p zu.dbpath="$DATA.zu1") ;;
+  zu2)     ARGS=(-p zu2.path="$DATA.zu2" -p zu2.index_buckets="$((RECORDS / 4 + 1))") ;;
   pg)      ARGS=(-p pg.host="${PGHOST:-127.0.0.1}" -p pg.port="${PGPORT:-55432}"
                  -p pg.user="${PGUSER:-postgres}" -p pg.password="${PGPASSWORD:-benchpass}"
                  -p pg.db="${PGDATABASE:-ycsb}" -p pg.sslmode=disable) ;;
@@ -78,11 +79,23 @@ esac
 # shellcheck disable=SC2206
 EXTRA=(${EXTRA_ARGS:-})
 
+# zu2's ordered plane is off by default and workload E is the only thing
+# here that needs it. Turning it on costs a skip list insert per new key,
+# so it stays off for C and A rather than being set once for the sweep.
+# Same condition bench-engine.sh applies, kept in step with it.
+if [ "$ENGINE" = zu2 ] && [ "$WORKLOAD" = workloade ]; then
+  EXTRA+=(-p zu2.ordered=true)
+fi
+
 case "$ENGINE" in
   sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
   duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
-  ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
+  ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
+                 "$DATA.lbug.checkpoint.apply.lock" \
+                 "$DATA.lbug.checkpoint.intent.lock" ;;
   zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
+  zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
+                 "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
 esac
 
 DROP=()
@@ -104,13 +117,13 @@ field() { sed -n "s/.*$1: \([0-9.]*\).*/\1/p" <<<"$2" | tail -1; }
 } | tee "$OUT"
 
 echo "loading $RECORDS records into $ENGINE" >&2
-"$BIN" load "$ENGINE" -P "workloads/$WORKLOAD" "${ARGS[@]}" "${EXTRA[@]}" "${DROP[@]}" \
+"$BIN" load "$ENGINE" -P "workloads/$WORKLOAD" "${ARGS[@]}" "${EXTRA[@]+"${EXTRA[@]}"}" "${DROP[@]+"${DROP[@]}"}" \
   -p recordcount="$RECORDS" -p threadcount=1 -p batch.size="$BATCH" >/dev/null 2>&1
 
 printf 'engine\tworkload\trecords\tthreads\top\tops\tp50_us\tp99_us\n' | tee -a "$OUT"
 
 for t in "${THREADS[@]}"; do
-  all=$("$BIN" run "$ENGINE" -P "workloads/$WORKLOAD" "${ARGS[@]}" "${EXTRA[@]}" \
+  all=$("$BIN" run "$ENGINE" -P "workloads/$WORKLOAD" "${ARGS[@]}" "${EXTRA[@]+"${EXTRA[@]}"}" \
     -p recordcount="$RECORDS" -p operationcount="$OPS" -p threadcount="$t" 2>&1)
 
   # One row per operation kind rather than per run. Workload C has only
@@ -131,6 +144,10 @@ done
 case "$ENGINE" in
   sqlite)  rm -f "$DATA.db" "$DATA.db-wal" "$DATA.db-shm" "$DATA.db-journal" ;;
   duckdb)  rm -rf "$DATA.db" "$DATA.db.wal" ;;
-  ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" ;;
+  ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
+                 "$DATA.lbug.checkpoint.apply.lock" \
+                 "$DATA.lbug.checkpoint.intent.lock" ;;
   zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
+  zu2)     rm -rf "$DATA.zu2" "$DATA.zu2.ckpt" "$DATA.zu2.ckpt.writing" \
+                 "$DATA.zu2.cold" "$DATA.zu2.relink" ;;
 esac

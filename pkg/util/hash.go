@@ -18,13 +18,30 @@ import (
 	"hash/fnv"
 )
 
+// FNV-1a's 64 bit offset basis and prime, from the reference the
+// hash/fnv package implements.
+const (
+	fnv64aOffset = 14695981039346656037
+	fnv64aPrime  = 1099511628211
+)
+
 // Hash64 returns a fnv Hash of the integer.
+//
+// The eight bytes are hashed here rather than through hash/fnv, which
+// allocates a hasher on the heap for every call. This is the default
+// insert order, so it is called for every key of every operation of
+// every run, and it was on the profile of a driver that does nothing at
+// all (tamnd/zu#645). The bytes are the same bytes, big endian, and the
+// digest is the same digest, which TestHash64MatchesFnv holds.
 func Hash64(n int64) int64 {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[0:8], uint64(n))
-	hash := fnv.New64a()
-	hash.Write(b[0:8])
-	result := int64(hash.Sum64())
+	hash := uint64(fnv64aOffset)
+	for _, c := range b {
+		hash ^= uint64(c)
+		hash *= fnv64aPrime
+	}
+	result := int64(hash)
 	if result < 0 {
 		return -result
 	}

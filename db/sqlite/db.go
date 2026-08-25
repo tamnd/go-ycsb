@@ -46,7 +46,36 @@ const (
 	sqliteBusyTimeout         = "sqlite.busy_timeout"
 	sqliteOptimistic          = "sqlite.optimistic"
 	sqliteOptimisticBackoffMs = "sqlite.optimistic_backoff_ms"
+	sqliteCacheSize           = "sqlite.cache_size"
+	sqliteMmapSize            = "sqlite.mmap_size"
+	sqliteStmtCacheSize       = "sqlite.stmt_cache_size"
+	sqliteReadTx              = "sqlite.readtx"
+	sqliteTempStore           = "sqlite.temp_store"
 )
+
+// The driver name the adapter opens under. It is not "sqlite3", because
+// two of the settings sqlite needs to run at its best are per connection
+// pragmas with no DSN spelling in the driver, and a connect hook is the
+// only place a pool can apply them.
+const sqliteDriverName = "sqlite3_ycsb"
+
+// The pragmas the connect hook runs, set once by Create before the pool
+// opens its first connection. One process opens one database here, which
+// is why a package level value is enough.
+var sqliteConnPragmas []string
+
+func init() {
+	sql.Register(sqliteDriverName, &sqlite3.SQLiteDriver{
+		ConnectHook: func(c *sqlite3.SQLiteConn) error {
+			for _, p := range sqliteConnPragmas {
+				if _, err := c.Exec(p, nil); err != nil {
+					return fmt.Errorf("%s: %w", p, err)
+				}
+			}
+			return nil
+		},
+	})
+}
 
 type sqliteCreator struct {
 }
@@ -56,6 +85,7 @@ type sqliteDB struct {
 	db         *sql.DB
 	verbose    bool
 	optimistic bool
+	readTx     bool
 	backoffMs  int
 
 	bufPool *util.BufPool
@@ -107,15 +137,43 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	maxOpenConns := p.GetInt(sqliteMaxOpenConns, threads)
 	maxIdleConns := p.GetInt(sqliteMaxIdleConns, threads)
 
+	// Three more settings that sqlite is much slower without, and that
+	// the adapter did not set at all until the latency work went looking
+	// for why a read through here cost eight times what the same read
+	// costs in a C loop over the same database.
+	//
+	// The page cache is 2 MiB by default, which for any database worth
+	// benchmarking means a pread for every read. It is per connection,
+	// so 64 MiB at n threads is 64n and the number below is deliberately
+	// not a gigabyte: a run that swaps is a benchmark of the swap.
+	//
+	// The mapping is the cheaper half of the same thing. mmap pages are
+	// file backed and shared between connections, so a large mmap costs
+	// address space rather than memory, and it takes the copy out of the
+	// read path for anything the page cache misses.
+	//
+	// The statement cache is the driver's, off by default, which means
+	// every point read prepares and finalises a statement around one
+	// step. Thirty two is more shapes than this workload has.
+	cacheSize := p.GetString(sqliteCacheSize, "-65536")
+	mmapSize := p.GetString(sqliteMmapSize, "8589934592")
+	tempStore := p.GetString(sqliteTempStore, "MEMORY")
+	sqliteConnPragmas = []string{
+		fmt.Sprintf("PRAGMA mmap_size = %s;", mmapSize),
+		fmt.Sprintf("PRAGMA temp_store = %s;", tempStore),
+	}
+
 	v := url.Values{}
 	v.Set("cache", cache)
 	v.Set("mode", mode)
 	v.Set("_journal_mode", journalMode)
 	v.Set("_synchronous", synchronous)
 	v.Set("_busy_timeout", p.GetString(sqliteBusyTimeout, "5000"))
+	v.Set("_cache_size", cacheSize)
+	v.Set("_stmt_cache_size", p.GetString(sqliteStmtCacheSize, "32"))
 	dsn := fmt.Sprintf("file:%s?%s", dbPath, v.Encode())
 	var err error
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open(sqliteDriverName, dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +182,7 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	db.SetMaxIdleConns(maxIdleConns)
 
 	d.optimistic = p.GetBool(sqliteOptimistic, false)
+	d.readTx = p.GetBool(sqliteReadTx, false)
 	d.backoffMs = p.GetInt(sqliteOptimisticBackoffMs, 5)
 	d.verbose = p.GetBool(prop.Verbose, prop.VerboseDefault)
 	d.db = db
@@ -133,6 +192,24 @@ func (c sqliteCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 	if err := d.createTable(); err != nil {
 		return nil, err
 	}
+
+	// The engine version, in the output, once, for the same reason the
+	// duckdb adapter prints its own: the library is linked in and there
+	// is nothing on the host to ask, so without this line the TSV cannot
+	// say which sqlite produced a row. The build tags decide whether
+	// that is the bundled amalgamation or the system library, and those
+	// are two different engines with two different numbers.
+	var version string
+	if err := d.db.QueryRow("select sqlite_version()").Scan(&version); err == nil {
+		fmt.Printf("sqlite version: %s\n", version)
+	}
+	// The settings that turned out to be worth a factor of two on a
+	// point read, printed for the same reason the version is: a row in a
+	// TSV that does not say how the engine was configured cannot be
+	// compared with anything.
+	fmt.Printf("sqlite config: journal=%s synchronous=%s cache=%s cache_size=%s mmap_size=%s stmt_cache_size=%s readtx=%v conns=%d\n",
+		journalMode, synchronous, cache, cacheSize, mmapSize,
+		p.GetString(sqliteStmtCacheSize, "32"), d.readTx, maxOpenConns)
 
 	return d, nil
 }
@@ -201,7 +278,16 @@ func (db *sqliteDB) optimisticTx(ctx context.Context, f func(tx *sql.Tx) error) 
 	}
 }
 
-func (db *sqliteDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
+// What doQueryRows needs of the thing it runs on, which is the same for
+// a transaction and for the pool itself. A read that is one statement is
+// already atomic in sqlite, so it does not have to be given a BEGIN and
+// a COMMIT of its own, and those are two more statements across the cgo
+// boundary for a call that steps a cursor once.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+func (db *sqliteDB) doQueryRows(ctx context.Context, tx querier, query string, count int, args ...interface{}) ([]map[string][]byte, error) {
 	if db.verbose {
 		fmt.Printf("%s %v\n", query, args)
 	}
@@ -239,7 +325,7 @@ func (db *sqliteDB) doQueryRows(ctx context.Context, tx *sql.Tx, query string, c
 	return vs, rows.Err()
 }
 
-func (db *sqliteDB) doRead(ctx context.Context, tx *sql.Tx, table string, key string, fields []string) (map[string][]byte, error) {
+func (db *sqliteDB) doRead(ctx context.Context, tx querier, table string, key string, fields []string) (map[string][]byte, error) {
 	var query string
 	if len(fields) == 0 {
 		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY = ?`, table)
@@ -259,6 +345,9 @@ func (db *sqliteDB) doRead(ctx context.Context, tx *sql.Tx, table string, key st
 }
 
 func (db *sqliteDB) Read(ctx context.Context, table string, key string, fields []string) (map[string][]byte, error) {
+	if !db.readTx {
+		return db.doRead(ctx, db.db, table, key, fields)
+	}
 	var output map[string][]byte
 	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doRead(ctx, tx, table, key, fields)
@@ -268,12 +357,18 @@ func (db *sqliteDB) Read(ctx context.Context, table string, key string, fields [
 	return output, err
 }
 
-func (db *sqliteDB) doScan(ctx context.Context, tx *sql.Tx, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+func (db *sqliteDB) doScan(ctx context.Context, tx querier, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	// ORDER BY for the reason the duckdb driver gives. SQLite happens to
+	// walk the primary key index here and so was already returning rows
+	// in order, which is why the scan integrity check passes either way,
+	// but that is the plan it picked and not a promise it made. Asking
+	// for the order it is already producing costs nothing and stops the
+	// answer depending on a plan choice.
 	var query string
 	if len(fields) == 0 {
-		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, table)
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`, table)
 	} else {
-		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? LIMIT ?`, strings.Join(fields, ","), table)
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`, strings.Join(fields, ","), table)
 	}
 
 	rows, err := db.doQueryRows(ctx, tx, query, count, startKey, count)
@@ -281,7 +376,124 @@ func (db *sqliteDB) doScan(ctx context.Context, tx *sql.Tx, table string, startK
 	return rows, err
 }
 
+// ScanEach is Scan with the maps taken out, the ycsb.EachScanner path.
+//
+// The map path here is the most wasteful of any driver in the tree: a
+// map, a dest slice and a fresh []byte a column, all allocated a row, and
+// a scan is fifty rows. This keeps one of each and refills them, and
+// hands the callback the column values positionally in the order the
+// caller asked for them, which is the order the SELECT names them in.
+//
+// Refilling the dest slice is not enough on its own and this said it was
+// for a while. Scanning into a *[]byte has database/sql clone the
+// driver's bytes into a fresh slice whatever is already there, so the
+// per column allocation survived the rewrite that was meant to remove
+// it. sql.RawBytes is what actually removes it, and the body says why
+// that is allowed here.
+//
+// The columns are named rather than starred even when the caller asked
+// for every field. SELECT * also returns YCSB_KEY, which is not a field
+// and has no slot, so naming them keeps the row and the fields slice the
+// same shape and stops sqlite reading a column nobody wanted.
+//
+// The values are the driver's own and are good until the callback
+// returns. See tamnd/zu#750.
+func (db *sqliteDB) ScanEach(ctx context.Context, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
+	if count <= 0 {
+		return nil
+	}
+	if !db.readTx {
+		return db.doScanEach(ctx, db.db, table, startKey, count, fields, fn)
+	}
+	return db.optimisticTx(ctx, func(tx *sql.Tx) error {
+		return db.doScanEach(ctx, tx, table, startKey, count, fields, fn)
+	})
+}
+
+func (db *sqliteDB) doScanEach(ctx context.Context, tx querier, table string, startKey string, count int, fields []string, fn func(values [][]byte) error) error {
+	var query string
+	if len(fields) == 0 {
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`, table)
+	} else {
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= ? ORDER BY YCSB_KEY LIMIT ?`,
+			strings.Join(fields, ","), table)
+	}
+	if db.verbose {
+		fmt.Printf("%s [%s %d]\n", query, startKey, count)
+	}
+
+	rows, err := tx.QueryContext(ctx, query, startKey, count)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+
+	// Where each column goes, or -1 for one that has no slot. Naming the
+	// fields makes this the identity; starring them also brings back
+	// YCSB_KEY, which is not a field and is dropped, so what the callback
+	// sees is the non key columns in table order either way.
+	slot := make([]int, len(cols))
+	n := 0
+	for i, c := range cols {
+		if len(fields) == 0 && c == "YCSB_KEY" {
+			slot[i] = -1
+			continue
+		}
+		slot[i] = n
+		n++
+	}
+
+	// sql.RawBytes and not []byte, which is the difference between this
+	// path allocating nothing a row and allocating one buffer a column a
+	// row. Scanning into a *[]byte makes database/sql clone the driver's
+	// bytes into a fresh slice every time, whatever is already in the
+	// destination, so the dest slice was being reused and the thing it
+	// pointed at was not. Fifty rows of ten columns is five hundred
+	// allocations a scan that the map path was being blamed for.
+	//
+	// The contract is what makes this allowed. RawBytes is the driver's
+	// own memory and is good only until the next Next, Scan or Close on
+	// these rows, and ycsb.EachScanner says the values are good until the
+	// callback returns, which is strictly sooner. That is the same bargain
+	// the lmdb driver makes with its read transaction.
+	raws := make([]sql.RawBytes, n)
+	var skip sql.RawBytes
+	dest := make([]interface{}, len(cols))
+	for i := range dest {
+		if slot[i] < 0 {
+			dest[i] = &skip
+			continue
+		}
+		dest[i] = &raws[slot[i]]
+	}
+
+	// [][]byte and []sql.RawBytes are different types even though the
+	// element is the same memory, so the callback's view is built once
+	// and refilled with slice headers a row, which allocates nothing.
+	values := make([][]byte, n)
+	for rows.Next() {
+		if err := rows.Scan(dest...); err != nil {
+			return err
+		}
+		for i := range raws {
+			values[i] = raws[i]
+		}
+		if err := fn(values); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 func (db *sqliteDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	if !db.readTx {
+		return db.doScan(ctx, db.db, table, startKey, count, fields)
+	}
 	var output []map[string][]byte
 	err := db.optimisticTx(ctx, func(tx *sql.Tx) error {
 		res, err := db.doScan(ctx, tx, table, startKey, count, fields)

@@ -263,11 +263,18 @@ func (db *pgDB) Read(ctx context.Context, table string, key string, fields []str
 }
 
 func (db *pgDB) Scan(ctx context.Context, table string, startKey string, count int, fields []string) ([]map[string][]byte, error) {
+	// ORDER BY for the reason the duckdb driver gives: YCSB's scan is the
+	// next count records in key order, and without being asked for that
+	// order an engine is free to return any count rows above the start
+	// key in whatever order the plan produced them. PostgreSQL took that
+	// freedom, and the scan integrity check catches it as keys that do
+	// not climb. Left as it was, workload E was timing pg on a cheaper
+	// query than the one the other engines were answering.
 	var query string
 	if len(fields) == 0 {
-		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= $1 LIMIT $2`, table)
+		query = fmt.Sprintf(`SELECT * FROM %s WHERE YCSB_KEY >= $1 ORDER BY YCSB_KEY LIMIT $2`, table)
 	} else {
-		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= $1 LIMIT $2`, strings.Join(fields, ","), table)
+		query = fmt.Sprintf(`SELECT %s FROM %s WHERE YCSB_KEY >= $1 ORDER BY YCSB_KEY LIMIT $2`, strings.Join(fields, ","), table)
 	}
 
 	rows, err := db.queryRows(ctx, query, count, startKey, count)
