@@ -18,7 +18,18 @@ THREADS="${2:-1}"
 shift 2 2>/dev/null || shift $#
 ENGINES=("$@")
 if [ ${#ENGINES[@]} -eq 0 ]; then
-  ENGINES=(sqlite duckdb ladybug pg neo4j mongodb)
+  # The same list build-engine.sh defaults to, because the top of this
+  # file says every engine and for a long time it meant six of them. Nine
+  # adapters landed after that line was written, boltdb most recently, and
+  # a run with no arguments quietly left every one of them out. An engine
+  # that will not build on the host is named and dropped below, so the
+  # cost of listing one that is not there is a line of output.
+  #
+  # Ordered so the embedded engines go first and the three that need a
+  # container go last. A sweep that dies partway then still has the rows
+  # that did not depend on anything outside the process.
+  ENGINES=(sqlite duckdb ladybug lmdb boltdb badger pebble zu zu2
+    redis valkey keydb garnet pg neo4j mongodb)
 fi
 
 WORK="${WORK:-$PWD/.bench}"

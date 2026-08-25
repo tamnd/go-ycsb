@@ -59,6 +59,16 @@ case "$ENGINE" in
   sqlite)  ARGS=(-p sqlite.db="$DATA.db" -p sqlite.journalmode=WAL -p sqlite.synchronous=OFF) ;;
   duckdb)  ARGS=(-p duckdb.dbpath="$DATA.db") ;;
   ladybug) ARGS=(-p ladybug.dbpath="$DATA.lbug") ;;
+  # The plain key value engines, which this sweep never had and which are
+  # the ones a fieldcount question is most pointed at: their whole cost is
+  # the row encoding and the write, with no planner or table in between.
+  # no_sync on bolt for the reason bench-engine.sh gives, that every
+  # engine here is measured at its fastest setting and this is the only
+  # durability knob it has.
+  lmdb)    ARGS=(-p lmdb.dir="$DATA.lmdb") ;;
+  boltdb)  ARGS=(-p bolt.path="$DATA.bolt" -p bolt.no_sync="${BOLT_NO_SYNC:-true}") ;;
+  badger)  ARGS=(-p badger.dir="$DATA.badger") ;;
+  pebble)  ARGS=(-p pebble.dir="$DATA.pebble") ;;
   zu)      ARGS=(-p zu.dbpath="$DATA.zu1") ;;
   # Sized off the record count like bench-engine.sh does, for the same
   # reason: the table grows under traffic, so this only saves the load
@@ -83,6 +93,10 @@ reset_data() {
     ladybug) rm -rf "$DATA.lbug" "$DATA.lbug.wal" "$DATA.lbug.wal.checkpoint" \
                    "$DATA.lbug.checkpoint.apply.lock" \
                    "$DATA.lbug.checkpoint.intent.lock" ;;
+    lmdb)    rm -rf "$DATA.lmdb" ;;
+    boltdb)  rm -f "$DATA.bolt" ;;
+    badger)  rm -rf "$DATA.badger" ;;
+    pebble)  rm -rf "$DATA.pebble" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # The log plus every sidecar. The bytes column below globs $DATA.*, so
     # a checkpoint left by the previous fieldcount would be charged to the

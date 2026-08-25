@@ -48,6 +48,10 @@ args_for() {  # args_for <recordcount>
     sqlite)  echo "-p sqlite.db=$DATA.db -p sqlite.journalmode=WAL -p sqlite.synchronous=OFF" ;;
     duckdb)  echo "-p duckdb.dbpath=$DATA.db" ;;
     ladybug) echo "-p ladybug.dbpath=$DATA.lbug" ;;
+    lmdb)    echo "-p lmdb.dir=$DATA.lmdb" ;;
+    boltdb)  echo "-p bolt.path=$DATA.bolt -p bolt.no_sync=${BOLT_NO_SYNC:-true}" ;;
+    badger)  echo "-p badger.dir=$DATA.badger" ;;
+    pebble)  echo "-p pebble.dir=$DATA.pebble" ;;
     zu)      echo "-p zu.dbpath=$DATA.zu1" ;;
     # The bucket hint is the reason args_for takes the record count at
     # all. Sizing it per point keeps the table at the same load factor
@@ -58,6 +62,21 @@ args_for() {  # args_for <recordcount>
     neo4j)   echo "-p neo4j.uri=${NEO4J_URI:-bolt://127.0.0.1:7687} -p neo4j.username=${NEO4J_USER:-neo4j} -p neo4j.password=${NEO4J_PASSWORD:-benchpass}" ;;
   esac
 }
+
+# bench-fields.sh rejects an engine it does not know and this did not,
+# so an unlisted engine fell through args_for with an empty string, ran
+# against whatever path the driver defaults to, and wrote a TSV that
+# looks like every other one. A sweep of an engine this script has no
+# arguments for is a wrong answer and not a missing feature.
+#
+# The check is here and not an arm inside args_for, because args_for is
+# called as $(args_for "$r") and an exit inside a command substitution
+# ends the subshell and nothing else. The script would have carried on
+# with empty ARGS, which is the case being ruled out.
+if [ -z "$(args_for "${RECORDS[0]}")" ]; then
+  echo "unknown engine $ENGINE" >&2
+  exit 1
+fi
 
 reset_data() {
   case "$ENGINE" in
