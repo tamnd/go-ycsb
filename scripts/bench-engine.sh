@@ -143,6 +143,21 @@ case "$ENGINE" in
     # defaults, which are no fsync and a writable map.
     ENGINE_ARGS=(-p "lmdb.dir=$DATA.lmdb")
     ;;
+  boltdb)
+    # A single mmap'd file holding one B+ tree, one writer at a time and
+    # readers in MVCC snapshots, which is the oldest and simplest shape
+    # in this set and the reason it is worth a row: it is the cost of a
+    # page tree with no LSM and no log structure at all.
+    #
+    # no_sync because every engine here is measured at its fastest
+    # setting and this is the only durability knob Bolt has. Left on, a
+    # load is one fsync a record and ten thousand records take 78
+    # seconds, which is a measurement of the disk and not of the B+
+    # tree. The one thing to keep in mind reading the row is that Bolt
+    # with no_sync still writes and mmaps every page, so this buys it
+    # less than synchronous=OFF buys sqlite.
+    ENGINE_ARGS=(-p "bolt.path=$DATA.bolt" -p "bolt.no_sync=${BOLT_NO_SYNC:-true}")
+    ;;
   pebble)
     # Everything else takes the adapter's defaults, which are Pebble's
     # own except for the block cache. Eight MiB is the library default
@@ -185,6 +200,7 @@ reset_data() {
                    "$DATA.lbug.checkpoint.intent.lock" ;;
     badger)  rm -rf "$DATA.badger" ;;
     lmdb)    rm -rf "$DATA.lmdb" ;;
+    boltdb)  rm -f "$DATA.bolt" ;;
     pebble)  rm -rf "$DATA.pebble" ;;
     zu)      rm -rf "$DATA.zu1" "$DATA.zu1.wal" ;;
     # A zu2 database is a log and three sidecars beside it, and removing
@@ -460,7 +476,7 @@ space() {  # space <workload> <phase>
   # on gamingpc for workload b and the log said nothing.
   if [ "${kb:-0}" -le 0 ]; then
     case "$ENGINE" in
-      sqlite|duckdb|ladybug|badger|pebble|lmdb|zu|zu2)
+      sqlite|duckdb|ladybug|badger|pebble|lmdb|boltdb|zu|zu2)
         echo "# $1 $2: WRONG, $ENGINE left nothing at $DATA.*" | tee -a "$OUT"
         ;;
     esac

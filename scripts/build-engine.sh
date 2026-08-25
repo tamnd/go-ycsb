@@ -24,7 +24,7 @@ mkdir -p "$WORK"
 
 ENGINES=("$@")
 if [ "${1:-}" = "all" ] || [ $# -eq 0 ]; then
-  ENGINES=(sqlite duckdb ladybug neo4j pg redis valkey keydb garnet badger pebble lmdb zu zu2)
+  ENGINES=(sqlite duckdb ladybug neo4j pg redis valkey keydb garnet badger pebble lmdb boltdb zu zu2)
 fi
 
 for e in "${ENGINES[@]}"; do
@@ -37,11 +37,11 @@ for e in "${ENGINES[@]}"; do
     # in, and they still get a binary each so nothing else is linked
     # beside them. valkey is the redis adapter under another name, so the
     # tag would be redis either way.
-    # badger has no tag either. It is pure Go and came with go-ycsb
-    # compiled in unconditionally, so a -tags badger would be a tag
-    # nothing reads. It still gets its own binary for the reason at the
-    # top of this file.
-    pg|mongodb|redis|valkey|keydb|garnet|badger) tag="" ;;
+    # badger and boltdb have no tag either. Both are pure Go and came
+    # with go-ycsb compiled in unconditionally, so a -tags badger would
+    # be a tag nothing reads. They still get their own binary for the
+    # reason at the top of this file.
+    pg|mongodb|redis|valkey|keydb|garnet|badger|boltdb) tag="" ;;
   esac
 
   # Extra link flags, per engine and per platform.

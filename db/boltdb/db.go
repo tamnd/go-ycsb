@@ -33,12 +33,25 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/boltdb/bolt"
 	"github.com/magiconair/properties"
 	"github.com/pingcap/go-ycsb/pkg/prop"
 	"github.com/pingcap/go-ycsb/pkg/util"
 	"github.com/pingcap/go-ycsb/pkg/ycsb"
+	bolt "go.etcd.io/bbolt"
 )
+
+// bbolt and not github.com/boltdb/bolt, which is what this driver was
+// written against. That repository was archived in 2017 and its last
+// release, v1.3.1, is from May of that year. bbolt is the same file
+// format and the same API under new maintenance, and it is what every
+// consumer of Bolt has been on for years, etcd included. Measuring a
+// nine year old build against engines released this year is not a
+// comparison anybody can read, and the standing rule for this fork is
+// every engine at its latest version. tamnd/zu#726.
+//
+// The import is aliased so the rest of the file reads as it did. The
+// call surface this driver uses, Open, View, Update, Bucket, Get, Put,
+// Delete and Cursor, is identical in both.
 
 // properties
 const (
@@ -48,6 +61,7 @@ const (
 	boltReadOnly        = "bolt.read_only"
 	boltMmapFlags       = "bolt.mmap_flags"
 	boltInitialMmapSize = "bolt.initial_mmap_size"
+	boltNoSync          = "bolt.no_sync"
 )
 
 type boltCreator struct {
@@ -80,6 +94,21 @@ func (c boltCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 		return nil, err
 	}
 
+	// The one durability knob Bolt has, and it is a field on the open
+	// database rather than an option, which is why it is set here and
+	// not in getOptions. Every other engine in this harness is measured
+	// at its fastest setting, sqlite at synchronous=OFF, pg at
+	// synchronous_commit=off, lmdb with no fsync, so leaving Bolt at a
+	// fsync per commit would be reporting one engine's durability as
+	// another engine's throughput. A load at ten thousand records took
+	// 78 seconds with this off, 128 inserts a second, and that number is
+	// a measurement of the disk. tamnd/zu#726.
+	//
+	// Off by default rather than on, because it is the library's own
+	// default and a harness should not quietly make a database less
+	// durable than the caller asked for. The sweep sets it.
+	db.NoSync = p.GetBool(boltNoSync, false)
+
 	return &boltDB{
 		p:       p,
 		db:      db,
@@ -91,7 +120,13 @@ func (c boltCreator) Create(p *properties.Properties) (ycsb.DB, error) {
 func getOptions(p *properties.Properties) boltOptions {
 	path := p.GetString(boltPath, "/tmp/boltdb")
 
-	opts := bolt.DefaultOptions
+	// A copy of the defaults and not the pointer. DefaultOptions is a
+	// package level *Options, so assigning it and then writing through
+	// it edits the library's own defaults for the rest of the process.
+	// Nothing in this harness opens a second Bolt database, so it has
+	// never shown, and it is still not something this should be doing.
+	defaults := *bolt.DefaultOptions
+	opts := &defaults
 	opts.Timeout = p.GetDuration(boltTimeout, 0)
 	opts.NoGrowSync = p.GetBool(boltNoGrowSync, false)
 	opts.ReadOnly = p.GetBool(boltReadOnly, false)
