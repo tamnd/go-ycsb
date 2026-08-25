@@ -16,6 +16,7 @@ package measurement
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -146,6 +147,16 @@ func (m *measurement) output() {
 	err = w.Flush()
 	if err != nil {
 		panic("failed to flush output: " + err.Error())
+	}
+
+	// After the table and on stderr, so a script collecting the table on
+	// stdout is unaffected and a person reading the run sees it. Once, on
+	// the final output rather than on each periodic summary, because a
+	// note repeated every ten seconds is one nobody reads.
+	if hs, ok := out.(*histograms); ok {
+		for _, note := range hs.errorNotes() {
+			fmt.Fprintln(os.Stderr, note)
+		}
 	}
 }
 

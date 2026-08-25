@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/magiconair/properties"
@@ -87,6 +88,59 @@ func (h *histograms) summary() map[string][]string {
 
 func (h *histograms) Summary() {
 	h.Output(os.Stdout)
+}
+
+// errorNotes is one line per operation type that had a failure in it,
+// saying how many of the attempts failed.
+//
+// A failed operation is measured as OP_ERROR, so the summary of a run
+// where every scan failed has a SCAN_ERROR line carrying a latency
+// distribution and no SCAN line at all. Read quickly that is an engine
+// that does not scan. Read by a script that greps for ^SCAN it is a
+// missing cell. It is neither: it is a run that produced no result for
+// that operation, and the latencies on the ERROR line are the cost of
+// failing rather than the cost of the work. 4cc4b14 made the first error
+// of each type reach stderr, which says why; this says how much.
+//
+// The distinction that matters is total against partial. A run with a
+// handful of failures is still a result and the line is a footnote. A
+// run where every attempt failed is not a result and presenting it as
+// one is the hole this closes, which is the same hole as tamnd/zu#551
+// from the other side: that one caught an engine succeeding and
+// returning nothing, and nothing was catching an engine failing.
+func (h *histograms) errorNotes() []string {
+	const suffix = "_ERROR"
+	ops := make([]string, 0, len(h.histograms))
+	for op := range h.histograms {
+		if strings.HasSuffix(op, suffix) {
+			ops = append(ops, op)
+		}
+	}
+	sort.Strings(ops)
+
+	notes := make([]string, 0, len(ops))
+	for _, op := range ops {
+		base := strings.TrimSuffix(op, suffix)
+		failed := h.histograms[op].hist.TotalCount()
+		if failed == 0 {
+			continue
+		}
+		var ok int64
+		if m, has := h.histograms[base]; has {
+			ok = m.hist.TotalCount()
+		}
+		total := ok + failed
+		if ok == 0 {
+			notes = append(notes, fmt.Sprintf(
+				"# %s: every one of the %d attempts failed, so this run has no %s result. The %s latencies are the cost of failing.",
+				base, failed, base, op))
+			continue
+		}
+		notes = append(notes, fmt.Sprintf(
+			"# %s: %d of %d attempts failed (%.2f%%), and the %s line is over the %d that did not.",
+			base, failed, total, float64(failed)*100/float64(total), base, ok))
+	}
+	return notes
 }
 
 func (h *histograms) Output(w io.Writer) error {
