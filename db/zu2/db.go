@@ -954,7 +954,19 @@ func (db *zu2DB) printStorage() {
 	// different from one that is not. Printed only when there is a
 	// mapping to report, so every row taken with the option off reads
 	// the way it always did. tamnd/zu#757.
-	if mapped > 0 {
+	//
+	// The two counters are read one after the other and the maintainer
+	// does not stop while that happens, so mapped can come back larger
+	// than the resident count captured a moment earlier. These are
+	// uint64, and the subtraction underflows into something like 1.8e13
+	// MiB, which is the kind of number that reads as a broken engine
+	// rather than as a racing report line. Clamped, and the row says
+	// what it did rather than quietly printing a smaller gap.
+	if mapped > resident {
+		fmt.Printf("zu2 pages: %d mapped against %d resident, "+
+			"the two counters were read a moment apart, anonymous 0.0 MiB\n",
+			mapped, resident)
+	} else if mapped > 0 {
 		fmt.Printf("zu2 pages: %d of %d resident are mapped, %.1f MiB anonymous\n",
 			mapped, resident, float64((resident-mapped)*pageBytes)/mib)
 	}
